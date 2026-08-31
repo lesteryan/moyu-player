@@ -1,4 +1,4 @@
-# dock-video-demo
+# moyu-player
 
 macOS Dock 图标动态渲染实验：把视频帧或 Android 投屏画面实时写入 Dock 图标。
 
