@@ -138,6 +138,44 @@ func makeIconContext() -> CGContext {
               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
 }
 
+// MARK: - ADB (master only)
+
+let adbPath: String = {
+    let sdk = NSString("~/Library/Android/sdk/platform-tools/adb").expandingTildeInPath
+    return FileManager.default.isExecutableFile(atPath: sdk) ? sdk : "/usr/bin/env"
+}()
+
+@discardableResult
+func runAdb(_ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: adbPath)
+    p.arguments = adbPath.hasSuffix("env") ? ["adb"] + args : args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return "" }
+    p.waitUntilExit()
+    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+}
+
+func adbHasDevice() -> Bool {
+    runAdb(["devices"])
+        .split(separator: "\n").dropFirst()  // skip "List of devices attached"
+        .contains { $0.hasSuffix("\tdevice") }
+}
+
+// Wait until adb sees a device. If none, restart the adb server and retry
+// every 10s — recovers from USB disconnect/reconnect and wedged adb daemons.
+func waitForAdbDevice() async {
+    while !adbHasDevice() {
+        log("no adb device — restarting adb server, retrying in 10s...")
+        runAdb(["kill-server"])
+        runAdb(["start-server"])
+        try? await Task.sleep(nanoseconds: 10_000_000_000)
+    }
+    log("adb device present")
+}
+
 // MARK: - Scrcpy process (master only)
 
 let scrcpyWindowTitle = "dock-scrcpy-src"
@@ -173,8 +211,9 @@ func launchScrcpy() {
     env["SDL_MAC_BACKGROUND_APP"] = "1"  // accessory app: no Dock icon for scrcpy
     proc.environment = env
     proc.terminationHandler = { _ in
-        log("scrcpy exited")
-        DispatchQueue.main.async { NSApp.terminate(nil) }
+        // Device disconnect kills scrcpy. Exit 2 so start.sh relaunches us:
+        // the fresh master waits for an adb device before starting scrcpy.
+        DispatchQueue.main.async { masterFail("scrcpy exited (device disconnected?)") }
     }
     do {
         try proc.run()
@@ -609,6 +648,7 @@ sigtermSrc.resume()
 if isMaster {
     Task { @MainActor in
         await killStaleScrcpy()
+        await waitForAdbDevice()
         launchScrcpy()
         await startCapture()
     }

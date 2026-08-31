@@ -38,6 +38,7 @@ master/viewer + 共享内存，单 SCK 流：
 - **master (index 0)** — 计算所有 crop 的 bounding box，启动 scrcpy 带 `--crop=bbox`（服务端第一次裁剪），用**单条** SCStream 捕获 scrcpy 窗口，渲染所有 crop：自己的 crop 直接设为 Dock 图标，其余 crop 缩放到 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap，头部 seq 计数器）。管理 scrcpy 生命周期，提供 Settings 菜单（⌘,）。
 - **viewer (index ≥1)** — 纯共享内存读取器，30fps 轮询 seq，变化时把像素设为自己的 Dock 图标。**完全不碰 ScreenCaptureKit**。
 - `start.sh` — 先启动 viewers（独立等待 master），再循环运行 master：master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。
+- **断连自愈** — scrcpy 退出（如 USB 断开）→ master exit(2) → start.sh 重启；新 master 启动前先等 adb 有设备：无设备则 `adb kill-server` + `start-server`，等 10 秒重试，循环直到设备回来。
 
 ### 捕获链路的坑（已修，勿回退）
 
