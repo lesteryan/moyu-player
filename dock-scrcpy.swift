@@ -19,6 +19,11 @@ let shmPixelBytes = iconSize * iconSize * 4
 let shmSize = shmHeaderSize + shmPixelBytes
 func shmPath(_ i: Int) -> String { "/tmp/dock-scrcpy-frame-\(i).raw" }
 
+// Serial queue for SCStream callbacks and every shm write: a concurrent queue
+// overlaps callbacks (races on shared CGContexts, out-of-order shm writes), and
+// placeholder broadcasts must not interleave with frame writes.
+let captureQueue = DispatchQueue(label: "dock-scrcpy.capture")
+
 struct CropRect {
     var w: Int, h: Int, x: Int, y: Int
     var string: String { "\(w):\(h):\(x):\(y)" }
@@ -120,15 +125,25 @@ final class FrameBuffer {
 
     var seq: UInt64 { ptr.load(fromByteOffset: 0, as: UInt64.self) }
 
+    // Seqlock: odd seq = write in progress. A plain post-increment lets a reader
+    // that copies during the write (before seq changes) pass its recheck.
     func write(pixels: UnsafeRawPointer) {
+        let start = seq &+ 1  // odd
+        ptr.storeBytes(of: start, toByteOffset: 0, as: UInt64.self)
+        OSMemoryBarrier()
         memcpy(ptr + shmHeaderSize, pixels, shmPixelBytes)
-        let next = seq &+ 1
-        ptr.storeBytes(of: next, toByteOffset: 0, as: UInt64.self)
+        OSMemoryBarrier()
+        ptr.storeBytes(of: start &+ 1, toByteOffset: 0, as: UInt64.self)  // even: published
     }
 
-    func read(into buf: UnsafeMutableRawPointer) -> UInt64 {
+    // Returns the frame's seq, or nil if a write was in flight (caller retries).
+    func read(into buf: UnsafeMutableRawPointer) -> UInt64? {
+        let s1 = seq
+        guard s1 % 2 == 0 else { return nil }
+        OSMemoryBarrier()
         memcpy(buf, ptr + shmHeaderSize, shmPixelBytes)
-        return seq
+        OSMemoryBarrier()
+        return seq == s1 ? s1 : nil
     }
 }
 
@@ -138,6 +153,33 @@ func makeIconContext() -> CGContext {
               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
 }
 
+// Placeholder icon: dark tile with a white SF Symbol (used for "waiting",
+// "disconnected", "screen off" states so users see status instead of a frozen frame).
+func placeholderContext(_ symbol: String) -> CGContext {
+    let ctx = makeIconContext()
+    ctx.setFillColor(CGColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: iconSize, height: iconSize))
+    let cfg = NSImage.SymbolConfiguration(pointSize: 64, weight: .regular)
+        .applying(.init(paletteColors: [NSColor(white: 1, alpha: 0.85)]))
+    if let sym = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+        let prev = NSGraphicsContext.current
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        let sz = sym.size
+        let target = CGFloat(iconSize) * 0.5
+        let s = min(target / max(sz.width, 1), target / max(sz.height, 1))
+        let w = sz.width * s, h = sz.height * s
+        sym.draw(in: NSRect(x: (CGFloat(iconSize) - w) / 2, y: (CGFloat(iconSize) - h) / 2, width: w, height: h),
+                 from: .zero, operation: .sourceOver, fraction: 1)
+        NSGraphicsContext.current = prev
+    }
+    return ctx
+}
+
+func placeholderIcon(_ symbol: String) -> NSImage? {
+    guard let cg = placeholderContext(symbol).makeImage() else { return nil }
+    return NSImage(cgImage: cg, size: NSSize(width: iconSize, height: iconSize))
+}
+
 // MARK: - ADB (master only)
 
 let adbPath: String = {
@@ -145,17 +187,22 @@ let adbPath: String = {
     return FileManager.default.isExecutableFile(atPath: sdk) ? sdk : "/usr/bin/env"
 }()
 
-@discardableResult
-func runAdb(_ args: [String]) -> String {
+func runAdbData(_ args: [String]) -> Data {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: adbPath)
     p.arguments = adbPath.hasSuffix("env") ? ["adb"] + args : args
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = FileHandle.nullDevice
-    do { try p.run() } catch { return "" }
+    do { try p.run() } catch { return Data() }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return data
+}
+
+@discardableResult
+func runAdb(_ args: [String]) -> String {
+    String(data: runAdbData(args), encoding: .utf8) ?? ""
 }
 
 func adbHasDevice() -> Bool {
@@ -167,13 +214,56 @@ func adbHasDevice() -> Bool {
 // Wait until adb sees a device. If none, restart the adb server and retry
 // every 10s — recovers from USB disconnect/reconnect and wedged adb daemons.
 func waitForAdbDevice() async {
+    var attempts = 0
     while !adbHasDevice() {
-        log("no adb device — restarting adb server, retrying in 10s...")
+        masterRenderer?.broadcastPlaceholder("iphone.slash")
+        attempts += 1
+        if attempts > 10 {
+            log("no adb device after 10 retries — giving up")
+            dropDockTile()
+            exit(1)
+        }
+        log("no adb device — restarting adb server, retrying in 10s... (\(attempts)/10)")
         runAdb(["kill-server"])
         runAdb(["start-server"])
         try? await Task.sleep(nanoseconds: 10_000_000_000)
     }
     log("adb device present")
+}
+
+// MARK: - Device brightness (master only)
+
+// Dim the device screen while mirroring; restore on quit. The original value is
+// persisted to a file because master restarts itself via exit(2) — a fresh
+// incarnation must not mistake the already-dimmed level for the original.
+let brightnessSaveFile = "/tmp/dock-scrcpy-brightness.saved"
+
+func dimDeviceBrightness() {
+    if !FileManager.default.fileExists(atPath: brightnessSaveFile) {
+        var mode = runAdb(["shell", "settings", "get", "system", "screen_brightness_mode"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if Int(mode) == nil { mode = "0" }  // some ROMs return "null"
+        let level = runAdb(["shell", "settings", "get", "system", "screen_brightness"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Int(level) != nil else {
+            log("cannot read device brightness — skip dimming")
+            return
+        }
+        try? "\(mode) \(level)".write(toFile: brightnessSaveFile, atomically: true, encoding: .utf8)
+    }
+    runAdb(["shell", "settings", "put", "system", "screen_brightness_mode", "0"])  // disable auto
+    runAdb(["shell", "settings", "put", "system", "screen_brightness", "1"])
+    log("device brightness dimmed")
+}
+
+func restoreDeviceBrightness() {
+    guard let s = try? String(contentsOfFile: brightnessSaveFile, encoding: .utf8) else { return }
+    let parts = s.split(separator: " ").map(String.init)
+    guard parts.count == 2 else { return }
+    runAdb(["shell", "settings", "put", "system", "screen_brightness", parts[1]])
+    runAdb(["shell", "settings", "put", "system", "screen_brightness_mode", parts[0]])
+    try? FileManager.default.removeItem(atPath: brightnessSaveFile)
+    log("device brightness restored (\(parts[1]), mode \(parts[0]))")
 }
 
 // MARK: - Scrcpy process (master only)
@@ -206,7 +296,7 @@ func launchScrcpy() {
     proc.executableURL = URL(fileURLWithPath: "/bin/bash")
     proc.currentDirectoryURL = URL(fileURLWithPath: scrcpyDir)
     proc.arguments = ["-c",
-        "./run x --crop=\(bbox.string) --window-borderless --window-title=\(scrcpyWindowTitle) --window-x=\(winX) --window-y=\(winY) --max-fps=\(Int(fps))"]
+        "./run x --crop=\(bbox.string) --turn-screen-off --window-borderless --window-title=\(scrcpyWindowTitle) --window-x=\(winX) --window-y=\(winY) --max-fps=\(Int(fps))"]
     var env = ProcessInfo.processInfo.environment
     env["SDL_MAC_BACKGROUND_APP"] = "1"  // accessory app: no Dock icon for scrcpy
     proc.environment = env
@@ -219,6 +309,7 @@ func launchScrcpy() {
         try proc.run()
     } catch {
         log("ERROR: failed to launch scrcpy: \(error)")
+        dropDockTile()
         exit(1)
     }
     scrcpyProc = proc
@@ -250,9 +341,9 @@ func killTree(_ pid: pid_t) {
 }
 
 func stopScrcpy() {
+    scrcpyProc?.terminationHandler = nil  // avoid masterFail re-entry when we kill it ourselves
     if scrcpyWindowPID > 0 { kill(scrcpyWindowPID, SIGTERM) }
     if let proc = scrcpyProc, proc.isRunning {
-        proc.terminationHandler = nil
         killTree(proc.processIdentifier)
     }
 }
@@ -261,6 +352,7 @@ func stopScrcpy() {
 // recovery from a poisoned SCK connection.
 func masterFail(_ reason: String) -> Never {
     log("FATAL: \(reason) — exiting for restart")
+    masterRenderer?.broadcastPlaceholder("iphone.slash")  // viewers show disconnect, not a frozen frame
     dropDockTile()
     stopScrcpy()
     exit(2)
@@ -310,6 +402,22 @@ final class MasterRenderer: NSObject, SCStreamOutput {
         }
     }
 
+    // Push a status placeholder to own Dock icon and every viewer's shm buffer.
+    // Callers are on the main thread; shm writes hop onto captureQueue so they
+    // never interleave with in-flight frame writes from the stream callback.
+    func broadcastPlaceholder(_ symbol: String) {
+        let ctx = placeholderContext(symbol)
+        if let data = ctx.data {
+            captureQueue.sync {
+                for fb in writers.values { fb.write(pixels: data) }
+            }
+        }
+        guard let cg = ctx.makeImage() else { return }
+        let img = NSImage(cgImage: cg, size: NSSize(width: iconSize, height: iconSize))
+        if Thread.isMainThread { NSApp.applicationIconImage = img }
+        else { DispatchQueue.main.async { NSApp.applicationIconImage = img } }
+    }
+
     private func croppedIcon(_ ci: CIImage, crop: CropRect, iconCtx: CGContext) -> CGImage? {
         let frameW = ci.extent.width, frameH = ci.extent.height
         let scaleX = frameW / CGFloat(max(bbox.w, 1))
@@ -323,7 +431,8 @@ final class MasterRenderer: NSObject, SCStreamOutput {
         var cropped = ci.cropped(to: CGRect(x: dx, y: ciY, width: cw, height: ch))
         guard !cropped.extent.isEmpty else { return nil }
 
-        // Square-crop, then downscale into the 128x128 icon context
+        // Square-crop, downscale to 128, then render straight into the icon
+        // bitmap (avoids an intermediate full-res CGImage readback per crop).
         let w = cropped.extent.width, h = cropped.extent.height
         if w != h {
             let side = min(w, h)
@@ -331,12 +440,21 @@ final class MasterRenderer: NSObject, SCStreamOutput {
             let oy = cropped.extent.origin.y + (h - side) / 2
             cropped = cropped.cropped(to: CGRect(x: ox, y: oy, width: side, height: side))
         }
-        guard let full = ctx.createCGImage(cropped, from: cropped.extent) else { return nil }
-        iconCtx.draw(full, in: CGRect(x: 0, y: 0, width: iconSize, height: iconSize))
+        let side = cropped.extent.width
+        guard side > 0, let dst = iconCtx.data else { return nil }
+        let s = CGFloat(iconSize) / side
+        var img = cropped.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        img = img.transformed(by: CGAffineTransform(translationX: -img.extent.origin.x,
+                                                    y: -img.extent.origin.y))
+        ctx.render(img, toBitmap: dst, rowBytes: iconSize * 4,
+                   bounds: CGRect(x: 0, y: 0, width: iconSize, height: iconSize),
+                   format: .BGRA8, colorSpace: CGColorSpaceCreateDeviceRGB())
         return iconCtx.makeImage()
     }
 }
 
+// Serial queue: SCStream on a concurrent queue may overlap callbacks — races
+// on the shared CGContexts and out-of-order shm writes.
 class StreamDelegate: NSObject, SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("stream stopped: \(error.localizedDescription)")
@@ -349,9 +467,10 @@ let masterRenderer: MasterRenderer? = isMaster ? MasterRenderer() : nil  // view
 var activeStream: SCStream?
 var retryPending = false
 var captureAttempts = 0
+var screenOffPaused = false
 
 func scheduleRetry() {
-    guard !retryPending else { return }
+    guard !retryPending, !screenOffPaused else { return }
     retryPending = true
     activeStream = nil
     captureAttempts += 1
@@ -408,7 +527,7 @@ func startCapture() async {
 
     do {
         let stream = SCStream(filter: filter, configuration: cfg, delegate: streamDelegate)
-        try stream.addStreamOutput(masterRenderer!, type: .screen, sampleHandlerQueue: .global())
+        try stream.addStreamOutput(masterRenderer!, type: .screen, sampleHandlerQueue: captureQueue)
         try await stream.startCapture()
         activeStream = stream
         log("capturing bbox=\(bbox.string) at \(Int(fps))fps")
@@ -432,41 +551,170 @@ func startCapture() async {
     }
 }
 
+// MARK: - Screen-off pause (master only)
+
+// Poll device screen state via adb; when the screen is off, stop the capture
+// stream (saves CPU/GPU) and show a moon placeholder. Resume when it's back on.
+func setScreenState(awake: Bool) {
+    if !awake && !screenOffPaused && activeStream != nil {
+        screenOffPaused = true
+        let s = activeStream
+        activeStream = nil
+        Task { try? await s?.stopCapture() }
+        masterRenderer?.broadcastPlaceholder("moon.fill")
+        log("device screen off — capture paused")
+    } else if awake && screenOffPaused {
+        screenOffPaused = false
+        log("device screen on — resuming capture")
+        Task { @MainActor in await startCapture() }
+    }
+}
+
+func startScreenStatePolling() {
+    let t = Timer(timeInterval: 5, repeats: true) { _ in
+        // Keepalive while paused: re-broadcast the placeholder so viewer seq
+        // keeps moving and their 10s stale detector doesn't cry disconnect.
+        if screenOffPaused { masterRenderer?.broadcastPlaceholder("moon.fill") }
+        DispatchQueue.global().async {
+            let out = runAdb(["shell", "dumpsys", "power"])
+            guard out.contains("mWakefulness=") else { return }  // no device / unknown format
+            let awake = out.contains("mWakefulness=Awake")
+            DispatchQueue.main.async { setScreenState(awake: awake) }
+        }
+    }
+    RunLoop.main.add(t, forMode: .common)  // keep firing during event tracking
+}
+
 // MARK: - Viewer: poll shared memory
 
 func viewerLoop() {
     var fb: FrameBuffer?
     var lastSeq: UInt64 = 0
-    var staleTicks = 0
+    var lastChange = Date()
+    var shownStale = false
     let pixels = UnsafeMutableRawPointer.allocate(byteCount: shmPixelBytes, alignment: 8)
+    // Poll well above the frame rate: master pushes frames on its own clock, so
+    // a free-running 30Hz poll adds up to a full frame of phase lag plus beat-
+    // frequency judder against master's 30Hz. At 120Hz the seq check is just an
+    // 8-byte load; pixels are copied only when the frame actually changed.
+    let pollHz: Double = 120
 
-    Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { _ in
+    if let img = placeholderIcon("hourglass") { NSApp.applicationIconImage = img }
+
+    let t = Timer(timeInterval: 1.0 / pollHz, repeats: true) { _ in
         if fb == nil {
             fb = FrameBuffer(index: myIndex, create: false)
             if fb == nil { return }  // master not up yet
             log("attached to \(shmPath(myIndex))")
         }
         guard let f = fb else { return }
-        let seq = f.read(into: pixels)
-        if seq == lastSeq {
-            staleTicks += 1
-            if staleTicks == Int(fps) * 30 { log("no new frames for 30s (master gone?)") }
+        guard f.seq != lastSeq else {
+            if !shownStale && Date().timeIntervalSince(lastChange) > 10 {
+                shownStale = true
+                log("no new frames for 10s (master gone?)")
+                if let img = placeholderIcon("iphone.slash") { NSApp.applicationIconImage = img }
+            }
             return
         }
+        // nil = write in flight (torn); retry on the next 8ms tick.
+        guard let seq = f.read(into: pixels), seq != lastSeq else { return }
         lastSeq = seq
-        staleTicks = 0
-        let ctx = CGContext(data: pixels, width: iconSize, height: iconSize, bitsPerComponent: 8,
-                            bytesPerRow: iconSize * 4, space: CGColorSpaceCreateDeviceRGB(),
-                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
-        guard let cg = ctx?.makeImage() else { return }
+        lastChange = Date()
+        shownStale = false
+        // Copy into an owned Data: a CGImage built directly over `pixels` is
+        // copy-on-write against context draws only — our raw memcpy next tick
+        // would mutate the image currently displayed in the Dock.
+        let frame = Data(bytes: pixels, count: shmPixelBytes)
+        guard let provider = CGDataProvider(data: frame as CFData),
+              let cg = CGImage(width: iconSize, height: iconSize, bitsPerComponent: 8, bitsPerPixel: 32,
+                               bytesPerRow: iconSize * 4, space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: false,
+                               intent: .defaultIntent) else { return }
         NSApp.applicationIconImage = NSImage(cgImage: cg, size: NSSize(width: iconSize, height: iconSize))
     }
+    RunLoop.main.add(t, forMode: .common)
 }
 
 // MARK: - Settings (master only)
 
+// Drag-to-select a square crop on a device screenshot. Flipped coords so view
+// y-down matches Android screen coordinates.
+final class CropPickerView: NSView {
+    private let image: NSImage
+    private let devW: CGFloat, devH: CGFloat
+    var onDrag: ((CropRect) -> Void)?
+    var onSelect: ((CropRect) -> Void)?
+    private var dragOrigin: CGPoint?
+    private var sel: CGRect = .zero  // device coords
+
+    override var isFlipped: Bool { true }
+
+    init(image: NSImage, deviceSize: CGSize, viewSize: CGSize) {
+        self.image = image
+        devW = deviceSize.width
+        devH = deviceSize.height
+        super.init(frame: NSRect(origin: .zero, size: viewSize))
+    }
+    required init?(coder: NSCoder) { fatalError("unsupported") }
+
+    private var scale: CGFloat { min(bounds.width / devW, bounds.height / devH) }
+
+    private func toDevice(_ e: NSEvent) -> CGPoint {
+        let p = convert(e.locationInWindow, from: nil)
+        return CGPoint(x: max(0, min(devW, p.x / scale)), y: max(0, min(devH, p.y / scale)))
+    }
+
+    private var crop: CropRect {
+        CropRect(w: Int(sel.width), h: Int(sel.height), x: Int(sel.origin.x), y: Int(sel.origin.y))
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.setFill()
+        bounds.fill()
+        image.draw(in: NSRect(x: 0, y: 0, width: devW * scale, height: devH * scale),
+                   from: .zero, operation: .sourceOver, fraction: 1,
+                   respectFlipped: true, hints: nil)
+        guard sel.width > 0 else { return }
+        let r = NSRect(x: sel.origin.x * scale, y: sel.origin.y * scale,
+                       width: sel.width * scale, height: sel.height * scale)
+        NSColor.systemRed.withAlphaComponent(0.2).setFill()
+        r.fill()
+        NSColor.systemRed.setStroke()
+        let path = NSBezierPath(rect: r)
+        path.lineWidth = 2
+        path.stroke()
+    }
+
+    override func mouseDown(with e: NSEvent) {
+        dragOrigin = toDevice(e)
+        sel = .zero
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with e: NSEvent) {
+        guard let o = dragOrigin else { return }
+        let p = toDevice(e)
+        var side = max(abs(p.x - o.x), abs(p.y - o.y))  // square crops: non-square wastes sample area
+        side = min(side, devW, devH)
+        var x = p.x >= o.x ? o.x : o.x - side
+        var y = p.y >= o.y ? o.y : o.y - side
+        x = max(0, min(x, devW - side))
+        y = max(0, min(y, devH - side))
+        sel = CGRect(x: x, y: y, width: side, height: side)
+        needsDisplay = true
+        onDrag?(crop)
+    }
+
+    override func mouseUp(with e: NSEvent) {
+        dragOrigin = nil
+        if sel.width >= 16 { onSelect?(crop) }
+    }
+}
+
 class SettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
+    private var pickerWindow: NSWindow?
     private var fields: [[NSTextField]] = []
     private var countControl: NSSegmentedControl!
     private var win2Widgets: [NSView] = []
@@ -518,10 +766,17 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
             title.font = .boldSystemFont(ofSize: 12)
             content.addSubview(title)
 
+            let pickBtn = NSButton(title: "框选…", target: self, action: #selector(pickCrop(_:)))
+            pickBtn.tag = wi
+            pickBtn.bezelStyle = .rounded
+            pickBtn.controlSize = .small
+            pickBtn.frame = NSRect(x: 120, y: titleY - 3, width: 74, height: 24)
+            content.addSubview(pickBtn)
+
             let labels = ["W:", "H:", "X:", "Y:"]
             let values = [crop.w, crop.h, crop.x, crop.y]
             var rowFields: [NSTextField] = []
-            var groupWidgets: [NSView] = [title]
+            var groupWidgets: [NSView] = [title, pickBtn]
 
             for (j, (lab, val)) in zip(labels, values).enumerated() {
                 let col = j % 2
@@ -581,18 +836,116 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @objc func countChanged() { updateVisibility() }
 
+    // Screenshot the device and let the user drag-select the crop area.
+    @objc func pickCrop(_ sender: NSButton) {
+        let wi = sender.tag
+        sender.isEnabled = false
+        DispatchQueue.global().async {
+            let data = runAdbData(["exec-out", "screencap", "-p"])
+            DispatchQueue.main.async {
+                sender.isEnabled = true
+                guard let img = NSImage(data: data), let rep = img.representations.first,
+                      rep.pixelsWide > 0, rep.pixelsHigh > 0 else {
+                    log("screencap failed (no device?)")
+                    NSSound.beep()
+                    return
+                }
+                self.showPicker(image: img,
+                                deviceSize: CGSize(width: rep.pixelsWide, height: rep.pixelsHigh),
+                                windowIndex: wi)
+            }
+        }
+    }
+
+    private func showPicker(image: NSImage, deviceSize: CGSize, windowIndex: Int) {
+        pickerWindow?.close()
+        let s = min(480 / deviceSize.width, 760 / deviceSize.height, 1)
+        let viewSize = CGSize(width: deviceSize.width * s, height: deviceSize.height * s)
+        let previewPane: CGFloat = 148
+        let totalSize = CGSize(width: viewSize.width + previewPane, height: max(viewSize.height, 180))
+
+        let container = NSView(frame: NSRect(origin: .zero, size: totalSize))
+        let picker = CropPickerView(image: image, deviceSize: deviceSize, viewSize: viewSize)
+        picker.setFrameOrigin(NSPoint(x: 0, y: totalSize.height - viewSize.height))
+        container.addSubview(picker)
+
+        // Live 128×128 preview: what the selection will look like as a Dock icon.
+        let preview = NSImageView(frame: NSRect(x: viewSize.width + 10, y: totalSize.height - 138,
+                                                width: 128, height: 128))
+        preview.imageScaling = .scaleProportionallyUpOrDown
+        preview.wantsLayer = true
+        preview.layer?.backgroundColor = CGColor(gray: 0.1, alpha: 1)
+        preview.layer?.cornerRadius = 22  // approximate Dock tile rounding
+        preview.layer?.masksToBounds = true
+        container.addSubview(preview)
+
+        let hint = NSTextField(labelWithString: "Dock 预览")
+        hint.frame = NSRect(x: viewSize.width + 10, y: totalSize.height - 160, width: 128, height: 16)
+        hint.alignment = .center
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        container.addSubview(hint)
+
+        let devW = deviceSize.width, devH = deviceSize.height
+        let renderPreview: (CropRect) -> Void = { c in
+            guard c.w > 0 else { return }
+            let out = NSImage(size: NSSize(width: 128, height: 128))
+            out.lockFocus()
+            let sx = image.size.width / devW, sy = image.size.height / devH
+            let from = NSRect(x: CGFloat(c.x) * sx, y: (devH - CGFloat(c.y) - CGFloat(c.h)) * sy,
+                              width: CGFloat(c.w) * sx, height: CGFloat(c.h) * sy)
+            image.draw(in: NSRect(x: 0, y: 0, width: 128, height: 128),
+                       from: from, operation: .copy, fraction: 1)
+            out.unlockFocus()
+            preview.image = out
+        }
+
+        let win = NSWindow(contentRect: NSRect(origin: .zero, size: totalSize),
+                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.title = "拖拽框选 Window \(windowIndex + 1)"
+        win.isReleasedWhenClosed = false
+        picker.onDrag = { [weak win] c in
+            win?.title = "\(c.w)×\(c.h) @ (\(c.x), \(c.y))"
+            renderPreview(c)
+        }
+        picker.onSelect = { [weak self, weak win] c in
+            guard let self, windowIndex < self.fields.count else { return }
+            let f = self.fields[windowIndex]
+            f[0].integerValue = c.w
+            f[1].integerValue = c.h
+            f[2].integerValue = c.x
+            f[3].integerValue = c.y
+            win?.close()
+        }
+        win.contentView = container
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        pickerWindow = win
+    }
+
     @objc func applySettings() {
         let count = countControl.selectedSegment + 1
         var crops: [CropRect] = []
         for i in 0..<count {
             let f = fields[i]
-            crops.append(CropRect(w: f[0].integerValue, h: f[1].integerValue,
-                                  x: f[2].integerValue, y: f[3].integerValue))
+            let c = CropRect(w: f[0].integerValue, h: f[1].integerValue,
+                             x: f[2].integerValue, y: f[3].integerValue)
+            guard c.w > 0, c.h > 0, c.x >= 0, c.y >= 0 else {
+                // Invalid crop would give scrcpy a degenerate --crop and loop restarts.
+                NSSound.beep()
+                log("invalid crop for window \(i + 1): \(c.string) — not saved")
+                return
+            }
+            crops.append(c)
         }
         allCrops = crops
         saveCrops(crops)
-        log("settings saved: \(crops.map(\.string)) — restart to apply")
-        window?.close()
+        // Exit 2: start.sh restarts master (and viewers) with the new config.
+        log("settings saved: \(crops.map(\.string)) — restarting to apply")
+        dropDockTile()
+        stopScrcpy()
+        exit(2)
     }
 
     @objc func closeSettings() { window?.close() }
@@ -609,7 +962,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationWillTerminate(_ n: Notification) {
         dropDockTile()
-        if isMaster { stopScrcpy() }
+        if isMaster {
+            stopScrcpy()
+            restoreDeviceBrightness()  // clean quit: hand the screen back at original brightness
+        }
     }
 
     private func setupMenu() {
@@ -647,10 +1003,13 @@ sigtermSrc.resume()
 
 if isMaster {
     Task { @MainActor in
+        masterRenderer?.broadcastPlaceholder("hourglass")
         await killStaleScrcpy()
         await waitForAdbDevice()
+        dimDeviceBrightness()
         launchScrcpy()
         await startCapture()
+        startScreenStatePolling()
     }
 } else {
     DispatchQueue.main.async { viewerLoop() }

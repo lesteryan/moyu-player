@@ -1,35 +1,72 @@
 #!/bin/bash
 cd "$(dirname "$0")"
 
-COUNT=$(python3 -c '
+window_count() {
+    python3 -c '
 import json, os
 p = os.path.expanduser("~/.config/dock-scrcpy.conf")
 try:
     print(len(json.load(open(p))["windows"]))
 except Exception:
-    print(2)')
+    print(2)'
+}
+
+# Fallback: master normally restores device brightness itself on clean quit.
+# If it died without restoring (kill -9, logout), the save file is still there.
+restore_brightness() {
+    local f=/tmp/dock-scrcpy-brightness.saved
+    [ -f "$f" ] || return 0
+    local adb="$HOME/Library/Android/sdk/platform-tools/adb"
+    [ -x "$adb" ] || adb=adb
+    local mode level
+    read -r mode level < "$f" || return 0
+    "$adb" shell settings put system screen_brightness "$level" 2>/dev/null &&
+        "$adb" shell settings put system screen_brightness_mode "$mode" 2>/dev/null &&
+        rm -f "$f" &&
+        echo "start.sh: restored device brightness ($level, mode $mode)" >&2
+}
 
 VIEWER_PIDS=""
-cleanup() {
+stop_viewers() {
     for p in $VIEWER_PIDS; do kill "$p" 2>/dev/null; done
+    VIEWER_PIDS=""
+}
+cleanup() {
+    stop_viewers
     wait 2>/dev/null
+    restore_brightness
 }
 trap cleanup EXIT INT TERM
 
-# Viewers are pure shared-memory readers; start them first, they wait for master.
-i=1
-while [ "$i" -lt "$COUNT" ]; do
-    ./dock-scrcpy "$i" &
-    VIEWER_PIDS="$VIEWER_PIDS $!"
-    i=$((i + 1))
-done
-
 # Master exits with code 2 to request a restart (fresh process resets a
-# poisoned ScreenCaptureKit connection).
+# poisoned ScreenCaptureKit connection; also used by Settings Apply).
+# Viewers are restarted each round so config changes (count/crops) take effect.
+# Backoff: 5 consecutive fast deaths (<30s) → sleep 30s, avoids a restart storm
+# when the failure is persistent (e.g. screen-recording permission revoked).
+FAILS=0
 while true; do
+    COUNT=$(window_count)
+    stop_viewers
+    i=1
+    while [ "$i" -lt "$COUNT" ]; do
+        ./dock-scrcpy "$i" &
+        VIEWER_PIDS="$VIEWER_PIDS $!"
+        i=$((i + 1))
+    done
+    STARTED=$(date +%s)
     ./dock-scrcpy 0
     code=$?
     [ "$code" -eq 2 ] || break
-    echo "start.sh: restarting master (exit $code)" >&2
-    sleep 1
+    if [ $(($(date +%s) - STARTED)) -lt 30 ]; then
+        FAILS=$((FAILS + 1))
+    else
+        FAILS=0
+    fi
+    if [ "$FAILS" -ge 5 ]; then
+        echo "start.sh: $FAILS fast failures — backing off 30s" >&2
+        sleep 30
+    else
+        echo "start.sh: restarting (exit $code)" >&2
+        sleep 1
+    fi
 done
