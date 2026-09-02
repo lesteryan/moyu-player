@@ -184,6 +184,24 @@ func placeholderIcon(_ symbol: String) -> NSImage? {
     return NSImage(cgImage: cg, size: NSSize(width: iconSize, height: iconSize))
 }
 
+// Camouflage icons for screen-off: each Dock tile impersonates an innocent
+// stock app (index 0 → Phone, index 1+ → Photos) instead of a telltale moon.
+let sleepCamoApps = ["/System/Applications/Phone.app", "/System/Applications/Photos.app"]
+
+func appIconContext(_ index: Int) -> CGContext? {
+    let path = sleepCamoApps[min(index, sleepCamoApps.count - 1)]
+    guard FileManager.default.fileExists(atPath: path) else { return nil }
+    let icon = NSWorkspace.shared.icon(forFile: path)
+    let ctx = makeIconContext()
+    ctx.clear(CGRect(x: 0, y: 0, width: iconSize, height: iconSize))
+    let prev = NSGraphicsContext.current
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+    icon.draw(in: NSRect(x: 0, y: 0, width: iconSize, height: iconSize),
+              from: .zero, operation: .sourceOver, fraction: 1)
+    NSGraphicsContext.current = prev
+    return ctx
+}
+
 // MARK: - ADB (master only)
 
 let adbPath: String = {
@@ -422,6 +440,23 @@ final class MasterRenderer: NSObject, SCStreamOutput {
         else { DispatchQueue.main.async { NSApp.applicationIconImage = img } }
     }
 
+    // Screen-off camouflage: each tile gets its stock-app disguise (falls back
+    // to the moon placeholder if the app icon can't be loaded).
+    func broadcastSleepCamo() {
+        var ownCtx: CGContext?
+        captureQueue.sync {
+            for (i, fb) in writers {
+                let ctx = appIconContext(i) ?? placeholderContext("moon.fill")
+                if let data = ctx.data { fb.write(pixels: data) }
+            }
+        }
+        ownCtx = appIconContext(myIndex) ?? placeholderContext("moon.fill")
+        guard let cg = ownCtx?.makeImage() else { return }
+        let img = NSImage(cgImage: cg, size: NSSize(width: iconSize, height: iconSize))
+        if Thread.isMainThread { NSApp.applicationIconImage = img }
+        else { DispatchQueue.main.async { NSApp.applicationIconImage = img } }
+    }
+
     private func croppedIcon(_ ci: CIImage, crop: CropRect, iconCtx: CGContext) -> CGImage? {
         let frameW = ci.extent.width, frameH = ci.extent.height
         let scaleX = frameW / CGFloat(max(bbox.w, 1))
@@ -565,7 +600,7 @@ func setScreenState(awake: Bool) {
         let s = activeStream
         activeStream = nil
         Task { try? await s?.stopCapture() }
-        masterRenderer?.broadcastPlaceholder("moon.fill")
+        masterRenderer?.broadcastSleepCamo()
         log("device screen off — capture paused")
     } else if awake && screenOffPaused {
         screenOffPaused = false
@@ -576,9 +611,9 @@ func setScreenState(awake: Bool) {
 
 func startScreenStatePolling() {
     let t = Timer(timeInterval: 5, repeats: true) { _ in
-        // Keepalive while paused: re-broadcast the placeholder so viewer seq
+        // Keepalive while paused: re-broadcast the camo icons so viewer seq
         // keeps moving and their 10s stale detector doesn't cry disconnect.
-        if screenOffPaused { masterRenderer?.broadcastPlaceholder("moon.fill") }
+        if screenOffPaused { masterRenderer?.broadcastSleepCamo() }
         DispatchQueue.global().async {
             let out = runAdb(["shell", "dumpsys", "power"])
             guard out.contains("mWakefulness=") else { return }  // no device / unknown format

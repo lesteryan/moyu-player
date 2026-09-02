@@ -30,7 +30,7 @@ master/viewer + 共享内存，单 SCStream：
 
 - **master (index 0)** — 计算所有 crop 的 bounding box，启动 scrcpy 带 `--crop=bbox`（服务端第一次裁剪），用单条 SCStream 捕获 scrcpy 窗口并渲染所有 crop：自己的 crop 直接设为 Dock 图标，其余缩放为 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap + seq 头）。管理 scrcpy 生命周期，提供 Settings 菜单（⌘,）。每 5s 轮询设备屏幕状态：熄屏时停流省电并显示 🌙 占位图标，亮屏自动恢复。
 - **viewer (index ≥1)** — 纯共享内存读取器，30fps 轮询 seq，变化时更新自己的 Dock 图标，完全不使用 ScreenCaptureKit。
-- **状态占位图标** — 等待时 hourglass、设备断连时 iphone.slash、熄屏时 moon，不再冻结最后一帧。
+- **状态占位图标** — 等待时 hourglass、设备断连时 iphone.slash、熄屏时伪装成 Phone/Photos 系统图标，不再冻结最后一帧。
 - **省电** — scrcpy 带 `--turn-screen-off` 物理灭屏；master 接管期间把设备亮度调到最低，退出时恢复（start.sh 有兜底）。设备熄屏时自动停流，亮屏恢复。
 - `start.sh` — 循环运行 master，每轮按配置重启 viewers；master 以退出码 2 请求重启（换新进程是修复 SCK 中毒连接的唯一可靠手段，Settings Apply 也走此路径热生效）。
 

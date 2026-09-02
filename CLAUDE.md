@@ -29,14 +29,14 @@ swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit
 
 master/viewer + 共享内存，单 SCK 流：
 
-- **master (index 0)** — 计算所有 crop 的 bounding box，启动 scrcpy 带 `--crop=bbox`（服务端第一次裁剪），用**单条** SCStream 捕获 scrcpy 窗口，渲染所有 crop：自己的 crop 直接设为 Dock 图标，其余 crop 缩放到 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap，头部 seq 计数器）。管理 scrcpy 生命周期，提供 Settings 菜单（⌘,）。每 5s `adb shell dumpsys power` 轮询 `mWakefulness`：熄屏 → 停 SCStream 省电 + 广播 moon 占位帧；亮屏 → 重新 startCapture（scheduleRetry 在 `screenOffPaused` 时被抑制，避免误重试）。
+- **master (index 0)** — 计算所有 crop 的 bounding box，启动 scrcpy 带 `--crop=bbox`（服务端第一次裁剪），用**单条** SCStream 捕获 scrcpy 窗口，渲染所有 crop：自己的 crop 直接设为 Dock 图标，其余 crop 缩放到 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap，头部 seq 计数器）。管理 scrcpy 生命周期，提供 Settings 菜单（⌘,）。每 5s `adb shell dumpsys power` 轮询 `mWakefulness`：熄屏 → 停 SCStream 省电 + 广播伪装图标（index 0 → Phone.app、index 1+ → Photos.app 的系统图标，加载失败回退 moon）；亮屏 → 重新 startCapture（scheduleRetry 在 `screenOffPaused` 时被抑制，避免误重试）。
 - **viewer (index ≥1)** — 纯共享内存读取器，**120Hz 轮询 seq 头**（8 字节读，廉价），变化才拷贝像素并更新 Dock 图标；拷贝后复核 seq 防撕裂。**完全不碰 ScreenCaptureKit**。启动显示 hourglass 占位，10s 无新帧显示 iphone.slash。（曾用 30Hz 轮询：与 master 的 30fps 推帧成两个自由时钟，相位差最多一整帧且拍频跳帧，肉眼可见一个图标恒定慢半拍——勿回退）
-- **状态占位图标** — `placeholderContext(symbol)` 生成深灰底 + 白色 SF Symbol 的 128×128 帧；master 的 `broadcastPlaceholder` 同时设自己图标并写入所有 viewer shm。启动 hourglass、无 adb 设备 / masterFail 时 iphone.slash、熄屏 moon.fill。
+- **状态占位图标** — `placeholderContext(symbol)` 生成深灰底 + 白色 SF Symbol 的 128×128 帧；master 的 `broadcastPlaceholder` 同时设自己图标并写入所有 viewer shm。启动 hourglass、无 adb 设备 / masterFail 时 iphone.slash、熄屏时显示伪装图标（Phone/Photos，`broadcastSleepCamo`）。
 - `start.sh` — 循环体内每轮读配置数、重启 viewers、运行 master：master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。Settings Apply 也以 exit(2) 走此路径热生效（含窗口数变化）。
 - **断连自愈** — scrcpy 退出（如 USB 断开）→ master exit(2) → start.sh 重启；新 master 启动前先等 adb 有设备：无设备则 `adb kill-server` + `start-server`，等 10 秒重试，循环直到设备回来。
 - **亮度接管** — master 启动后把设备亮度调到 1（关自动亮度），原值存 `/tmp/dock-scrcpy-brightness.saved`；只有文件不存在时才保存原值（防止 exit(2) 重启把已调暗值当原值）。正常退出（⌘Q/SIGTERM/SIGINT）恢复亮度并删文件；exit(2) 重启期间保持调暗。start.sh 退出 trap 里有兜底恢复（master 被 kill -9 时用存档文件恢复）。scrcpy 带 `--turn-screen-off`，镜像期间物理屏全黑。
 - **重启退避** — start.sh 检测连续快速死亡（<30s）：连续 5 次后每轮 sleep 30s，避免持续性故障（如录屏权限被撤销）导致的重启风暴。
-- **熄屏心跳** — 熄屏暂停期间 master 每 5s 重新广播 moon 占位帧（seq 递增），防止 viewer 的 10s 无帧检测误报断连。
+- **熄屏心跳** — 熄屏暂停期间 master 每 5s 重新广播伪装图标（seq 递增），防止 viewer 的 10s 无帧检测误报断连。
 
 ### 捕获链路的坑（已修，勿回退）
 
