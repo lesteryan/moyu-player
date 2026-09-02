@@ -121,6 +121,10 @@ final class FrameBuffer {
         }
         close(fd)
         ptr = m
+        // Reset seq when creating: a stale file from an older run (or protocol)
+        // can hold an odd seq, which would permanently invert the seqlock parity
+        // and make viewers reject every frame as "write in flight".
+        if create { ptr.storeBytes(of: UInt64(0), toByteOffset: 0, as: UInt64.self) }
     }
 
     var seq: UInt64 { ptr.load(fromByteOffset: 0, as: UInt64.self) }
