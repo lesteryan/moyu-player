@@ -53,32 +53,42 @@ func boundingBox(_ crops: [CropRect]) -> CropRect {
     return CropRect(w: maxR - minX, h: maxB - minY, x: minX, y: minY)
 }
 
-func loadCrops() -> [CropRect] {
+var turnScreenOffOnStart = true
+var autoScreenOffMinutes = 3  // 0 = disabled
+
+func loadConfig() -> [CropRect] {
     guard let data = FileManager.default.contents(atPath: configPath) else {
         return CropRect.defaultWindows
     }
-    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let arr = json["windows"] as? [[String: Any]] {
-        let crops = arr.compactMap { CropRect.from($0) }
-        if !crops.isEmpty { return crops }
+    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let v = json["turnScreenOff"] as? Bool { turnScreenOffOnStart = v }
+        if let v = json["autoScreenOffMinutes"] as? Int { autoScreenOffMinutes = max(0, v) }
+        if let arr = json["windows"] as? [[String: Any]] {
+            let crops = arr.compactMap { CropRect.from($0) }
+            if !crops.isEmpty { return crops }
+        }
     }
     if let text = String(data: data, encoding: .utf8) {
         let crops = text.components(separatedBy: "\n").compactMap { CropRect.parse($0) }
         if !crops.isEmpty {
-            saveCrops(crops)
+            saveConfig(crops)
             return crops
         }
     }
     return CropRect.defaultWindows
 }
 
-func saveCrops(_ crops: [CropRect]) {
-    let obj: [String: Any] = ["windows": crops.map(\.dict)]
+func saveConfig(_ crops: [CropRect]) {
+    let obj: [String: Any] = [
+        "windows": crops.map(\.dict),
+        "turnScreenOff": turnScreenOffOnStart,
+        "autoScreenOffMinutes": autoScreenOffMinutes,
+    ]
     guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
     try? data.write(to: URL(fileURLWithPath: configPath))
 }
 
-var allCrops = loadCrops()
+var allCrops = loadConfig()
 
 let myIndex: Int = {
     guard let arg = CommandLine.arguments.dropFirst().first, let idx = Int(arg) else { return 0 }
@@ -235,17 +245,14 @@ func adbHasDevice() -> Bool {
 
 // Wait until adb sees a device. If none, restart the adb server and retry
 // every 10s — recovers from USB disconnect/reconnect and wedged adb daemons.
+// Loops forever: exiting non-2 would stop start.sh's restart loop entirely,
+// so an overnight disconnect must never "give up".
 func waitForAdbDevice() async {
     var attempts = 0
     while !adbHasDevice() {
         masterRenderer?.broadcastPlaceholder("iphone.slash")
         attempts += 1
-        if attempts > 10 {
-            log("no adb device after 10 retries — giving up")
-            dropDockTile()
-            exit(1)
-        }
-        log("no adb device — restarting adb server, retrying in 10s... (\(attempts)/10)")
+        log("no adb device — restarting adb server, retrying in 10s... (attempt \(attempts))")
         runAdb(["kill-server"])
         runAdb(["start-server"])
         try? await Task.sleep(nanoseconds: 10_000_000_000)
@@ -253,39 +260,28 @@ func waitForAdbDevice() async {
     log("adb device present")
 }
 
-// MARK: - Device brightness (master only)
+// MARK: - Device screen on/off (master only)
 
-// Dim the device screen while mirroring; restore on quit. The original value is
-// persisted to a file because master restarts itself via exit(2) — a fresh
-// incarnation must not mistake the already-dimmed level for the original.
-let brightnessSaveFile = "/tmp/dock-scrcpy-brightness.saved"
+var deviceScreenIsOff = false
 
-func dimDeviceBrightness() {
-    if !FileManager.default.fileExists(atPath: brightnessSaveFile) {
-        var mode = runAdb(["shell", "settings", "get", "system", "screen_brightness_mode"])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if Int(mode) == nil { mode = "0" }  // some ROMs return "null"
-        let level = runAdb(["shell", "settings", "get", "system", "screen_brightness"])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard Int(level) != nil else {
-            log("cannot read device brightness — skip dimming")
-            return
-        }
-        try? "\(mode) \(level)".write(toFile: brightnessSaveFile, atomically: true, encoding: .utf8)
+func turnDeviceScreenOff() {
+    guard !deviceScreenIsOff else { return }
+    let out = runAdb(["shell", "dumpsys", "power"])
+    if out.contains("mWakefulness=Awake") {
+        runAdb(["shell", "input", "keyevent", "26"])  // POWER key
     }
-    runAdb(["shell", "settings", "put", "system", "screen_brightness_mode", "0"])  // disable auto
-    runAdb(["shell", "settings", "put", "system", "screen_brightness", "1"])
-    log("device brightness dimmed")
+    deviceScreenIsOff = true
+    log("device screen turned off")
 }
 
-func restoreDeviceBrightness() {
-    guard let s = try? String(contentsOfFile: brightnessSaveFile, encoding: .utf8) else { return }
-    let parts = s.split(separator: " ").map(String.init)
-    guard parts.count == 2 else { return }
-    runAdb(["shell", "settings", "put", "system", "screen_brightness", parts[1]])
-    runAdb(["shell", "settings", "put", "system", "screen_brightness_mode", parts[0]])
-    try? FileManager.default.removeItem(atPath: brightnessSaveFile)
-    log("device brightness restored (\(parts[1]), mode \(parts[0]))")
+func turnDeviceScreenOn() {
+    guard deviceScreenIsOff else { return }
+    let out = runAdb(["shell", "dumpsys", "power"])
+    if !out.contains("mWakefulness=Awake") {
+        runAdb(["shell", "input", "keyevent", "26"])  // POWER key
+    }
+    deviceScreenIsOff = false
+    log("device screen turned on")
 }
 
 // MARK: - Scrcpy process (master only)
@@ -317,8 +313,9 @@ func launchScrcpy() {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/bin/bash")
     proc.currentDirectoryURL = URL(fileURLWithPath: scrcpyDir)
-    proc.arguments = ["-c",
-        "./run x --crop=\(bbox.string) --turn-screen-off --window-borderless --window-title=\(scrcpyWindowTitle) --window-x=\(winX) --window-y=\(winY) --max-fps=\(Int(fps))"]
+    var scrcpyArgs = "./run x --crop=\(bbox.string) --window-borderless --window-title=\(scrcpyWindowTitle) --window-x=\(winX) --window-y=\(winY) --max-fps=\(Int(fps))"
+    if turnScreenOffOnStart { scrcpyArgs += " --turn-screen-off" }
+    proc.arguments = ["-c", scrcpyArgs]
     var env = ProcessInfo.processInfo.environment
     env["SDL_MAC_BACKGROUND_APP"] = "1"  // accessory app: no Dock icon for scrcpy
     proc.environment = env
@@ -604,7 +601,10 @@ func setScreenState(awake: Bool) {
         log("device screen off — capture paused")
     } else if awake && screenOffPaused {
         screenOffPaused = false
+        deviceScreenIsOff = false  // woken outside our control (physical button)
+        (NSApp.delegate as? AppDelegate)?.updateScreenToggleTitle()
         log("device screen on — resuming capture")
+        scheduleAutoScreenOff()  // re-arm the auto-off countdown
         Task { @MainActor in await startCapture() }
     }
 }
@@ -622,6 +622,28 @@ func startScreenStatePolling() {
         }
     }
     RunLoop.main.add(t, forMode: .common)  // keep firing during event tracking
+}
+
+// MARK: - Auto screen-off timer (master only)
+
+var autoScreenOffTimer: Timer?
+
+// Re-armed every time the screen comes (back) on: startup, ⌘D 亮屏, physical
+// power button. Only armed while the screen is actually on.
+func scheduleAutoScreenOff() {
+    autoScreenOffTimer?.invalidate()
+    autoScreenOffTimer = nil
+    guard autoScreenOffMinutes > 0, !deviceScreenIsOff else { return }
+    let mins = autoScreenOffMinutes
+    log("auto screen-off in \(mins) min")
+    autoScreenOffTimer = Timer.scheduledTimer(withTimeInterval: Double(mins) * 60, repeats: false) { _ in
+        DispatchQueue.global().async {
+            turnDeviceScreenOff()
+            DispatchQueue.main.async {
+                if let del = NSApp.delegate as? AppDelegate { del.updateScreenToggleTitle() }
+            }
+        }
+    }
 }
 
 // MARK: - Viewer: poll shared memory
@@ -756,7 +778,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     private var pickerWindow: NSWindow?
     private var fields: [[NSTextField]] = []
     private var countControl: NSSegmentedControl!
-    private var win2Widgets: [NSView] = []
+    private var screenOffCheck: NSButton!
+    private var autoOffField: NSTextField!
+    private var windowWidgets: [[NSView]] = []  // per-window widget groups, for show/hide
 
     func showSettings() {
         if let w = window, w.isVisible {
@@ -769,36 +793,57 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func buildWindow() {
+        // The UI supports at least 2 windows and grows to fit a hand-edited
+        // config with more — opening Settings must never silently drop crops.
+        let maxWindows = max(2, allCrops.count)
+        let blockH: CGFloat = 88  // per-window block: title + 2 field rows
         let pw: CGFloat = 340
-        let ph: CGFloat = 280
+        let ph: CGFloat = 164 + CGFloat(maxWindows) * blockH
         let content = NSView(frame: NSRect(x: 0, y: 0, width: pw, height: ph))
 
         let rowCount: CGFloat = ph - 32
-        let row1Title: CGFloat = ph - 62
-        let row1A: CGFloat = ph - 88
-        let row1B: CGFloat = ph - 118
-        let row2Title: CGFloat = ph - 150
-        let row2A: CGFloat = ph - 176
-        let row2B: CGFloat = ph - 206
+        let rowScreen: CGFloat = ph - 58
+        let rowAutoOff: CGFloat = ph - 84
         let rowBtn: CGFloat = 14
 
         let countLabel = NSTextField(labelWithString: "Windows:")
         countLabel.frame = NSRect(x: 20, y: rowCount, width: 70, height: 20)
         content.addSubview(countLabel)
 
-        countControl = NSSegmentedControl(labels: ["1", "2"], trackingMode: .selectOne, target: self, action: #selector(countChanged))
-        countControl.frame = NSRect(x: 100, y: rowCount, width: 100, height: 22)
-        countControl.selectedSegment = min(allCrops.count, 2) - 1
+        countControl = NSSegmentedControl(labels: (1...maxWindows).map(String.init), trackingMode: .selectOne, target: self, action: #selector(countChanged))
+        countControl.frame = NSRect(x: 100, y: rowCount, width: CGFloat(maxWindows) * 50, height: 22)
+        countControl.selectedSegment = min(allCrops.count, maxWindows) - 1
         content.addSubview(countControl)
 
-        fields = []
-        win2Widgets = []
+        screenOffCheck = NSButton(checkboxWithTitle: "启动时关闭手机屏幕", target: nil, action: nil)
+        screenOffCheck.frame = NSRect(x: 20, y: rowScreen, width: 200, height: 20)
+        screenOffCheck.state = turnScreenOffOnStart ? .on : .off
+        content.addSubview(screenOffCheck)
 
-        for wi in 0..<2 {
-            let crop = wi < allCrops.count ? allCrops[wi] : CropRect.defaultWindows[wi]
-            let titleY = wi == 0 ? row1Title : row2Title
-            let fieldRowA = wi == 0 ? row1A : row2A
-            let fieldRowB = wi == 0 ? row1B : row2B
+        let autoOffLabel = NSTextField(labelWithString: "自动黑屏 (分钟):")
+        autoOffLabel.frame = NSRect(x: 20, y: rowAutoOff, width: 110, height: 20)
+        content.addSubview(autoOffLabel)
+
+        autoOffField = NSTextField(frame: NSRect(x: 134, y: rowAutoOff, width: 50, height: 22))
+        autoOffField.integerValue = autoScreenOffMinutes
+        autoOffField.formatter = NumberFormatter()
+        content.addSubview(autoOffField)
+
+        let autoOffHint = NSTextField(labelWithString: "0=禁用")
+        autoOffHint.frame = NSRect(x: 190, y: rowAutoOff, width: 60, height: 20)
+        autoOffHint.font = .systemFont(ofSize: 11)
+        autoOffHint.textColor = .secondaryLabelColor
+        content.addSubview(autoOffHint)
+
+        fields = []
+        windowWidgets = []
+
+        for wi in 0..<maxWindows {
+            let crop = wi < allCrops.count ? allCrops[wi]
+                : CropRect.defaultWindows[min(wi, CropRect.defaultWindows.count - 1)]
+            let titleY = ph - 114 - CGFloat(wi) * blockH
+            let fieldRowA = titleY - 26
+            let fieldRowB = titleY - 56
 
             let title = NSTextField(labelWithString: "Window \(wi + 1)")
             title.frame = NSRect(x: 20, y: titleY, width: 100, height: 18)
@@ -837,7 +882,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
             }
 
             fields.append(rowFields)
-            if wi == 1 { win2Widgets = groupWidgets }
+            windowWidgets.append(groupWidgets)
         }
         updateVisibility()
 
@@ -869,8 +914,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func updateVisibility() {
-        let show2 = countControl.selectedSegment == 1
-        win2Widgets.forEach { $0.isHidden = !show2 }
+        let count = countControl.selectedSegment + 1
+        for (wi, group) in windowWidgets.enumerated() {
+            group.forEach { $0.isHidden = wi >= count }
+        }
     }
 
     @objc func countChanged() { updateVisibility() }
@@ -971,15 +1018,16 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
             let c = CropRect(w: f[0].integerValue, h: f[1].integerValue,
                              x: f[2].integerValue, y: f[3].integerValue)
             guard c.w > 0, c.h > 0, c.x >= 0, c.y >= 0 else {
-                // Invalid crop would give scrcpy a degenerate --crop and loop restarts.
                 NSSound.beep()
                 log("invalid crop for window \(i + 1): \(c.string) — not saved")
                 return
             }
             crops.append(c)
         }
+        turnScreenOffOnStart = screenOffCheck.state == .on
+        autoScreenOffMinutes = max(0, autoOffField.integerValue)
         allCrops = crops
-        saveCrops(crops)
+        saveConfig(crops)
         // Exit 2: start.sh restarts master (and viewers) with the new config.
         log("settings saved: \(crops.map(\.string)) — restarting to apply")
         dropDockTile()
@@ -1003,20 +1051,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dropDockTile()
         if isMaster {
             stopScrcpy()
-            restoreDeviceBrightness()  // clean quit: hand the screen back at original brightness
+            turnDeviceScreenOn()
         }
     }
+
+    private var screenToggleItem: NSMenuItem!
 
     private func setupMenu() {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
+        screenToggleItem = NSMenuItem(title: deviceScreenIsOff ? "亮屏" : "黑屏",
+                                      action: #selector(toggleScreen), keyEquivalent: "d")
+        appMenu.addItem(screenToggleItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit dock-scrcpy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
         NSApp.mainMenu = mainMenu
+    }
+
+    func updateScreenToggleTitle() {
+        screenToggleItem?.title = deviceScreenIsOff ? "亮屏" : "黑屏"
+    }
+
+    @objc func toggleScreen() {
+        DispatchQueue.global().async {
+            if deviceScreenIsOff {
+                turnDeviceScreenOn()
+            } else {
+                turnDeviceScreenOff()
+            }
+            DispatchQueue.main.async { [self] in
+                updateScreenToggleTitle()
+                scheduleAutoScreenOff()  // re-arm (no-op if screen is now off)
+            }
+        }
     }
 
     @objc func openSettings() {
@@ -1045,10 +1117,11 @@ if isMaster {
         masterRenderer?.broadcastPlaceholder("hourglass")
         await killStaleScrcpy()
         await waitForAdbDevice()
-        dimDeviceBrightness()
+        if turnScreenOffOnStart { deviceScreenIsOff = true }
         launchScrcpy()
         await startCapture()
         startScreenStatePolling()
+        scheduleAutoScreenOff()
     }
 } else {
     DispatchQueue.main.async { viewerLoop() }

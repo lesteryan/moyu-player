@@ -1,4 +1,4 @@
-# dock-video-demo
+# moyu-player
 
 macOS Dock 图标动态渲染实验。把 Android 投屏画面实时写入 Dock 图标。
 
@@ -14,7 +14,7 @@ swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit
 
 ## 依赖
 
-- dock-scrcpy 依赖 `../3rd/android-testing/scrcpy` 下的本地 scrcpy 构建（通过 `./run` 脚本启动）
+- dock-scrcpy 依赖 `../3rd/android-testing/scrcpy` 下的本地 scrcpy 构建（通过 `./run` 脚本启动），可用 `SCRCPY_DIR` 环境变量覆盖路径
 - 需要 USB 连接的 Android 设备（adb）
 
 ## 运行
@@ -34,7 +34,7 @@ master/viewer + 共享内存，单 SCK 流：
 - **状态占位图标** — `placeholderContext(symbol)` 生成深灰底 + 白色 SF Symbol 的 128×128 帧；master 的 `broadcastPlaceholder` 同时设自己图标并写入所有 viewer shm。启动 hourglass、无 adb 设备 / masterFail 时 iphone.slash、熄屏时显示伪装图标（Phone/Photos，`broadcastSleepCamo`）。
 - `start.sh` — 循环体内每轮读配置数、重启 viewers、运行 master：master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。Settings Apply 也以 exit(2) 走此路径热生效（含窗口数变化）。
 - **断连自愈** — scrcpy 退出（如 USB 断开）→ master exit(2) → start.sh 重启；新 master 启动前先等 adb 有设备：无设备则 `adb kill-server` + `start-server`，等 10 秒重试，循环直到设备回来。
-- **亮度接管** — master 启动后把设备亮度调到 1（关自动亮度），原值存 `/tmp/dock-scrcpy-brightness.saved`；只有文件不存在时才保存原值（防止 exit(2) 重启把已调暗值当原值）。正常退出（⌘Q/SIGTERM/SIGINT）恢复亮度并删文件；exit(2) 重启期间保持调暗。start.sh 退出 trap 里有兜底恢复（master 被 kill -9 时用存档文件恢复）。scrcpy 带 `--turn-screen-off`，镜像期间物理屏全黑。
+- **手机黑屏控制** — 配置项 `turnScreenOff`（Settings 里"启动时关闭手机屏幕"复选框）决定 scrcpy 是否带 `--turn-screen-off`。菜单"黑屏/亮屏"（⌘D）可运行时切换：通过 `adb shell input keyevent 26`（POWER 键）开关物理屏。正常退出自动亮屏。配置项 `autoScreenOffMinutes`（Settings"自动黑屏"，0=禁用）：屏幕点亮 N 分钟后自动灭屏，每次亮屏（⌘D / 物理电源键）都重新计时。
 - **重启退避** — start.sh 检测连续快速死亡（<30s）：连续 5 次后每轮 sleep 30s，避免持续性故障（如录屏权限被撤销）导致的重启风暴。
 - **熄屏心跳** — 熄屏暂停期间 master 每 5s 重新广播伪装图标（seq 递增），防止 viewer 的 10s 无帧检测误报断连。
 

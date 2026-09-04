@@ -11,21 +11,6 @@ except Exception:
     print(2)'
 }
 
-# Fallback: master normally restores device brightness itself on clean quit.
-# If it died without restoring (kill -9, logout), the save file is still there.
-restore_brightness() {
-    local f=/tmp/dock-scrcpy-brightness.saved
-    [ -f "$f" ] || return 0
-    local adb="$HOME/Library/Android/sdk/platform-tools/adb"
-    [ -x "$adb" ] || adb=adb
-    local mode level
-    read -r mode level < "$f" || return 0
-    "$adb" shell settings put system screen_brightness "$level" 2>/dev/null &&
-        "$adb" shell settings put system screen_brightness_mode "$mode" 2>/dev/null &&
-        rm -f "$f" &&
-        echo "start.sh: restored device brightness ($level, mode $mode)" >&2
-}
-
 VIEWER_PIDS=""
 stop_viewers() {
     for p in $VIEWER_PIDS; do kill "$p" 2>/dev/null; done
@@ -34,7 +19,6 @@ stop_viewers() {
 cleanup() {
     stop_viewers
     wait 2>/dev/null
-    restore_brightness
 }
 trap cleanup EXIT INT TERM
 
