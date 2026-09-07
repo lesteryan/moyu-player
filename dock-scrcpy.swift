@@ -54,7 +54,6 @@ func boundingBox(_ crops: [CropRect]) -> CropRect {
 }
 
 var turnScreenOffOnStart = true
-var autoScreenOffMinutes = 3  // 0 = disabled
 
 func loadConfig() -> [CropRect] {
     guard let data = FileManager.default.contents(atPath: configPath) else {
@@ -62,7 +61,6 @@ func loadConfig() -> [CropRect] {
     }
     if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         if let v = json["turnScreenOff"] as? Bool { turnScreenOffOnStart = v }
-        if let v = json["autoScreenOffMinutes"] as? Int { autoScreenOffMinutes = max(0, v) }
         if let arr = json["windows"] as? [[String: Any]] {
             let crops = arr.compactMap { CropRect.from($0) }
             if !crops.isEmpty { return crops }
@@ -82,7 +80,6 @@ func saveConfig(_ crops: [CropRect]) {
     let obj: [String: Any] = [
         "windows": crops.map(\.dict),
         "turnScreenOff": turnScreenOffOnStart,
-        "autoScreenOffMinutes": autoScreenOffMinutes,
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
     try? data.write(to: URL(fileURLWithPath: configPath))
@@ -593,6 +590,7 @@ func startCapture() async {
 // stream (saves CPU/GPU) and show a moon placeholder. Resume when it's back on.
 func setScreenState(awake: Bool) {
     if !awake && !screenOffPaused && activeStream != nil {
+        if deviceScreenIsOff { return }  // we turned it off; scrcpy keeps streaming
         screenOffPaused = true
         let s = activeStream
         activeStream = nil
@@ -601,11 +599,13 @@ func setScreenState(awake: Bool) {
         log("device screen off — capture paused")
     } else if awake && screenOffPaused {
         screenOffPaused = false
-        deviceScreenIsOff = false  // woken outside our control (physical button)
+        deviceScreenIsOff = false
         (NSApp.delegate as? AppDelegate)?.updateScreenToggleTitle()
         log("device screen on — resuming capture")
-        scheduleAutoScreenOff()  // re-arm the auto-off countdown
         Task { @MainActor in await startCapture() }
+    } else if awake && deviceScreenIsOff {
+        deviceScreenIsOff = false
+        (NSApp.delegate as? AppDelegate)?.updateScreenToggleTitle()
     }
 }
 
@@ -622,28 +622,6 @@ func startScreenStatePolling() {
         }
     }
     RunLoop.main.add(t, forMode: .common)  // keep firing during event tracking
-}
-
-// MARK: - Auto screen-off timer (master only)
-
-var autoScreenOffTimer: Timer?
-
-// Re-armed every time the screen comes (back) on: startup, ⌘D 亮屏, physical
-// power button. Only armed while the screen is actually on.
-func scheduleAutoScreenOff() {
-    autoScreenOffTimer?.invalidate()
-    autoScreenOffTimer = nil
-    guard autoScreenOffMinutes > 0, !deviceScreenIsOff else { return }
-    let mins = autoScreenOffMinutes
-    log("auto screen-off in \(mins) min")
-    autoScreenOffTimer = Timer.scheduledTimer(withTimeInterval: Double(mins) * 60, repeats: false) { _ in
-        DispatchQueue.global().async {
-            turnDeviceScreenOff()
-            DispatchQueue.main.async {
-                if let del = NSApp.delegate as? AppDelegate { del.updateScreenToggleTitle() }
-            }
-        }
-    }
 }
 
 // MARK: - Viewer: poll shared memory
@@ -779,7 +757,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     private var fields: [[NSTextField]] = []
     private var countControl: NSSegmentedControl!
     private var screenOffCheck: NSButton!
-    private var autoOffField: NSTextField!
     private var windowWidgets: [[NSView]] = []  // per-window widget groups, for show/hide
 
     func showSettings() {
@@ -798,12 +775,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         let maxWindows = max(2, allCrops.count)
         let blockH: CGFloat = 88  // per-window block: title + 2 field rows
         let pw: CGFloat = 340
-        let ph: CGFloat = 164 + CGFloat(maxWindows) * blockH
+        let ph: CGFloat = 138 + CGFloat(maxWindows) * blockH
         let content = NSView(frame: NSRect(x: 0, y: 0, width: pw, height: ph))
 
         let rowCount: CGFloat = ph - 32
         let rowScreen: CGFloat = ph - 58
-        let rowAutoOff: CGFloat = ph - 84
         let rowBtn: CGFloat = 14
 
         let countLabel = NSTextField(labelWithString: "Windows:")
@@ -820,28 +796,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         screenOffCheck.state = turnScreenOffOnStart ? .on : .off
         content.addSubview(screenOffCheck)
 
-        let autoOffLabel = NSTextField(labelWithString: "自动黑屏 (分钟):")
-        autoOffLabel.frame = NSRect(x: 20, y: rowAutoOff, width: 110, height: 20)
-        content.addSubview(autoOffLabel)
-
-        autoOffField = NSTextField(frame: NSRect(x: 134, y: rowAutoOff, width: 50, height: 22))
-        autoOffField.integerValue = autoScreenOffMinutes
-        autoOffField.formatter = NumberFormatter()
-        content.addSubview(autoOffField)
-
-        let autoOffHint = NSTextField(labelWithString: "0=禁用")
-        autoOffHint.frame = NSRect(x: 190, y: rowAutoOff, width: 60, height: 20)
-        autoOffHint.font = .systemFont(ofSize: 11)
-        autoOffHint.textColor = .secondaryLabelColor
-        content.addSubview(autoOffHint)
-
         fields = []
         windowWidgets = []
 
         for wi in 0..<maxWindows {
             let crop = wi < allCrops.count ? allCrops[wi]
                 : CropRect.defaultWindows[min(wi, CropRect.defaultWindows.count - 1)]
-            let titleY = ph - 114 - CGFloat(wi) * blockH
+            let titleY = ph - 88 - CGFloat(wi) * blockH
             let fieldRowA = titleY - 26
             let fieldRowB = titleY - 56
 
@@ -1025,7 +986,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
             crops.append(c)
         }
         turnScreenOffOnStart = screenOffCheck.state == .on
-        autoScreenOffMinutes = max(0, autoOffField.integerValue)
         allCrops = crops
         saveConfig(crops)
         // Exit 2: start.sh restarts master (and viewers) with the new config.
@@ -1086,7 +1046,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.async { [self] in
                 updateScreenToggleTitle()
-                scheduleAutoScreenOff()  // re-arm (no-op if screen is now off)
             }
         }
     }
@@ -1121,7 +1080,6 @@ if isMaster {
         launchScrcpy()
         await startCapture()
         startScreenStatePolling()
-        scheduleAutoScreenOff()
     }
 } else {
     DispatchQueue.main.async { viewerLoop() }
