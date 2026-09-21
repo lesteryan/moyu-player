@@ -1007,6 +1007,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         if isMaster { setupMenu() }
     }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        let crop = allCrops[myIndex]
+        let cx = crop.x + crop.w / 2
+        let cy = crop.y + crop.h / 2
+        DispatchQueue.global().async { runAdb(["shell", "input", "tap", "\(cx)", "\(cy)"]) }
+        return false
+    }
+
     func applicationWillTerminate(_ n: Notification) {
         dropDockTile()
         if isMaster {
