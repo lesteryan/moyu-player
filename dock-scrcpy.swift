@@ -7,6 +7,8 @@
 //   window proved fragile: -3805 races during window recreation, silently
 //   frameless streams that poison the process's SCK connection).
 import AppKit
+import AVFoundation
+import CoreMediaIO
 import ScreenCaptureKit
 
 let configPath = NSString("~/.config/dock-scrcpy.conf").expandingTildeInPath
@@ -376,13 +378,14 @@ func masterFail(_ reason: String) -> Never {
 
 // MARK: - Master: capture + render all crops
 
-final class MasterRenderer: NSObject, SCStreamOutput {
+final class MasterRenderer: NSObject, SCStreamOutput, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let ctx = CIContext()
     private let crops: [CropRect]  // snapshot: bbox is fixed at launch, live edits must not desync
     private var iconCtxs: [CGContext] = []
     private var writers: [Int: FrameBuffer] = [:]
     private var loggedFirstFrame = false
     private(set) var frameCount = 0
+    var bboxOverride: CropRect?
 
     override init() {
         crops = allCrops
@@ -401,14 +404,27 @@ final class MasterRenderer: NSObject, SCStreamOutput {
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, let buf = sb.imageBuffer else { return }
+        processFrame(CIImage(cvPixelBuffer: buf))
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from conn: AVCaptureConnection) {
+        guard let buf = sb.imageBuffer else { return }
+        processFrame(CIImage(cvPixelBuffer: buf))
+    }
+
+    func processFrame(_ ci: CIImage) {
         frameCount += 1
-        let ci = CIImage(cvPixelBuffer: buf)
         if !loggedFirstFrame {
             loggedFirstFrame = true
             log("first frame: \(Int(ci.extent.width))x\(Int(ci.extent.height))")
+            if isiOSMode {
+                bboxOverride = CropRect(w: Int(ci.extent.width), h: Int(ci.extent.height), x: 0, y: 0)
+                log("iOS bbox set to full screen: \(bboxOverride!.string)")
+            }
         }
+        let activeBBox = bboxOverride ?? bbox
         for (i, crop) in crops.enumerated() {
-            guard let cg = croppedIcon(ci, crop: crop, iconCtx: iconCtxs[i]) else { continue }
+            guard let cg = croppedIcon(ci, crop: crop, bbox: activeBBox, iconCtx: iconCtxs[i]) else { continue }
             if i == myIndex {
                 let img = NSImage(cgImage: cg, size: NSSize(width: iconSize, height: iconSize))
                 DispatchQueue.main.async { NSApp.applicationIconImage = img }
@@ -451,7 +467,7 @@ final class MasterRenderer: NSObject, SCStreamOutput {
         else { DispatchQueue.main.async { NSApp.applicationIconImage = img } }
     }
 
-    private func croppedIcon(_ ci: CIImage, crop: CropRect, iconCtx: CGContext) -> CGImage? {
+    private func croppedIcon(_ ci: CIImage, crop: CropRect, bbox: CropRect, iconCtx: CGContext) -> CGImage? {
         let frameW = ci.extent.width, frameH = ci.extent.height
         let scaleX = frameW / CGFloat(max(bbox.w, 1))
         let scaleY = frameH / CGFloat(max(bbox.h, 1))
@@ -485,6 +501,71 @@ final class MasterRenderer: NSObject, SCStreamOutput {
         return iconCtx.makeImage()
     }
 }
+
+// MARK: - iPhone capture (AVFoundation)
+
+func enableiOSDeviceDiscovery() {
+    var prop = CMIOObjectPropertyAddress(
+        mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
+        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+        mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    var yes: UInt32 = 1
+    CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &prop,
+                              0, nil, UInt32(MemoryLayout<UInt32>.size), &yes)
+}
+
+func findiOSDevice() -> AVCaptureDevice? {
+    enableiOSDeviceDiscovery()
+    let devices = AVCaptureDevice.DiscoverySession(
+        deviceTypes: [.external], mediaType: .muxed, position: .unspecified).devices
+    return devices.first { $0.modelID.contains("iPhone") || $0.modelID.contains("iPad") }
+}
+
+var iosSession: AVCaptureSession?
+
+func startiOSCapture() -> Bool {
+    guard let device = findiOSDevice() else { return false }
+    log("iOS device found: \(device.localizedName) (\(device.modelID))")
+
+    let session = AVCaptureSession()
+    guard let input = try? AVCaptureDeviceInput(device: device) else {
+        log("ERROR: cannot create AVCaptureDeviceInput for iOS device")
+        return false
+    }
+    guard session.canAddInput(input) else {
+        log("ERROR: cannot add iOS device input to session")
+        return false
+    }
+    session.addInput(input)
+
+    let output = AVCaptureVideoDataOutput()
+    output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+    output.alwaysDiscardsLateVideoFrames = true
+    output.setSampleBufferDelegate(masterRenderer!, queue: captureQueue)
+    guard session.canAddOutput(output) else {
+        log("ERROR: cannot add video output to session")
+        return false
+    }
+    session.addOutput(output)
+    session.startRunning()
+    iosSession = session
+    log("iOS capture started")
+
+    // Set bbox to full device screen on first frame — we use a watchdog
+    // to detect the actual resolution and update bboxOverride.
+    Task { @MainActor in
+        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        if masterRenderer!.frameCount == 0 {
+            log("no frames from iOS device after 4s")
+            session.stopRunning()
+            iosSession = nil
+            masterFail("iOS capture failed — no frames")
+        }
+    }
+    return true
+}
+
+var isiOSMode = false
 
 // Serial queue: SCStream on a concurrent queue may overlap callbacks — races
 // on the shared CGContexts and out-of-order shm writes.
@@ -1008,16 +1089,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if isMaster { setupMenu() }
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        let crop = allCrops[myIndex]
-        let cx = crop.x + crop.w / 2
-        let cy = crop.y + crop.h / 2
-        DispatchQueue.global().async { runAdb(["shell", "input", "tap", "\(cx)", "\(cy)"]) }
+        if !isiOSMode {
+            let crop = allCrops[myIndex]
+            let cx = crop.x + crop.w / 2
+            let cy = crop.y + crop.h / 2
+            DispatchQueue.global().async { runAdb(["shell", "input", "tap", "\(cx)", "\(cy)"]) }
+        }
         return false
     }
 
     func applicationWillTerminate(_ n: Notification) {
         dropDockTile()
-        if isMaster {
+        if isiOSMode {
+            iosSession?.stopRunning()
+        } else if isMaster {
             stopScrcpy()
             turnDeviceScreenOn()
         }
@@ -1082,12 +1167,18 @@ sigtermSrc.resume()
 if isMaster {
     Task { @MainActor in
         masterRenderer?.broadcastPlaceholder("hourglass")
-        await killStaleScrcpy()
-        await waitForAdbDevice()
-        if turnScreenOffOnStart { deviceScreenIsOff = true }
-        launchScrcpy()
-        await startCapture()
-        startScreenStatePolling()
+        if startiOSCapture() {
+            isiOSMode = true
+            log("running in iOS mode (no scrcpy, no adb)")
+        } else {
+            log("no iOS device — falling back to Android/scrcpy")
+            await killStaleScrcpy()
+            await waitForAdbDevice()
+            if turnScreenOffOnStart { deviceScreenIsOff = true }
+            launchScrcpy()
+            await startCapture()
+            startScreenStatePolling()
+        }
     }
 } else {
     DispatchQueue.main.async { viewerLoop() }

@@ -1,21 +1,22 @@
 # moyu-player
 
-macOS Dock 图标动态渲染实验。把 Android 投屏画面实时写入 Dock 图标。
+macOS Dock 图标动态渲染实验。把 Android/iPhone 投屏画面实时写入 Dock 图标。
 
 ## 工具
 
-- **dock-scrcpy** (`dock-scrcpy.swift`) — 通过 scrcpy 投屏 Android 设备画面到 Dock 图标，用 ScreenCaptureKit 捕获 scrcpy 窗口
+- **dock-scrcpy** (`dock-scrcpy.swift`) — 投屏 Android/iPhone 设备画面到 Dock 图标。Android 走 scrcpy + ScreenCaptureKit 捕获 scrcpy 窗口；iPhone 走 AVFoundation 直接捕获 USB 设备画面（无需 scrcpy）
 
 ## 构建
 
 ```bash
-swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit
+swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit -framework AVFoundation -framework CoreMediaIO
 ```
 
 ## 依赖
 
-- dock-scrcpy 依赖 `../3rd/android-testing/scrcpy` 下的本地 scrcpy 构建（通过 `./run` 脚本启动），可用 `SCRCPY_DIR` 环境变量覆盖路径
-- 需要 USB 连接的 Android 设备（adb）
+- Android 模式：依赖 `../3rd/android-testing/scrcpy` 下的本地 scrcpy 构建（通过 `./run` 脚本启动），可用 `SCRCPY_DIR` 环境变量覆盖路径，需要 USB 连接的 Android 设备（adb）
+- iPhone 模式：需要 USB 连接的 iPhone/iPad，无需额外工具（AVFoundation + CoreMediaIO 直接捕获）
+- 启动时自动检测：优先找 iPhone/iPad，没有则走 Android
 
 ## 运行
 
@@ -27,9 +28,11 @@ swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit
 
 ## dock-scrcpy 架构
 
-master/viewer + 共享内存，单 SCK 流：
+master/viewer + 共享内存。两种捕获模式自动切换：
 
-- **master (index 0)** — 计算所有 crop 的 bounding box，启动 scrcpy 带 `--crop=bbox`（服务端第一次裁剪），用**单条** SCStream 捕获 scrcpy 窗口，渲染所有 crop：自己的 crop 直接设为 Dock 图标，其余 crop 缩放到 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap，头部 seq 计数器）。管理 scrcpy 生命周期，提供 Settings 菜单（⌘,）。每 5s `adb shell dumpsys power` 轮询 `mWakefulness`：熄屏 → 停 SCStream 省电 + 广播伪装图标（index 0 → Phone.app、index 1+ → Photos.app 的系统图标，加载失败回退 moon）；亮屏 → 重新 startCapture（scheduleRetry 在 `screenOffPaused` 时被抑制，避免误重试）。
+- **iOS 模式** — 检测到 USB 连接的 iPhone/iPad 时启用。master 通过 AVFoundation `AVCaptureSession` 直接捕获设备屏幕画面（`CoreMediaIO` 启用 iOS 设备发现），帧回调走同一个 `processFrame` 路径。不启动 scrcpy、不用 SCK、不依赖 adb。bboxOverride 在首帧时设为设备全屏分辨率，crop 坐标直接对应设备屏幕像素。限制：无触控反馈（iOS 无公开远程触控注入接口），Dock 图标点击无操作。
+- **Android 模式（默认）** — 无 iOS 设备时走此路径。master 计算所有 crop 的 bounding box，启动 scrcpy 带 `--crop=bbox`（服务端第一次裁剪），用**单条** SCStream 捕获 scrcpy 窗口，渲染所有 crop。Dock 图标点击 → `adb shell input tap` crop 中心实现暂停/播放。
+- **master (index 0)** — 自己的 crop 直接设为 Dock 图标，其余 crop 缩放到 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap，头部 seq 计数器）。管理 scrcpy 生命周期（Android 模式），提供 Settings 菜单（⌘,）。每 5s `adb shell dumpsys power` 轮询 `mWakefulness`（仅 Android 模式）：熄屏 → 停 SCStream 省电 + 广播伪装图标（index 0 → Phone.app、index 1+ → Photos.app 的系统图标，加载失败回退 moon）；亮屏 → 重新 startCapture（scheduleRetry 在 `screenOffPaused` 时被抑制，避免误重试）。
 - **viewer (index ≥1)** — 纯共享内存读取器，**120Hz 轮询 seq 头**（8 字节读，廉价），变化才拷贝像素并更新 Dock 图标；拷贝后复核 seq 防撕裂。**完全不碰 ScreenCaptureKit**。启动显示 hourglass 占位，10s 无新帧显示 iphone.slash。（曾用 30Hz 轮询：与 master 的 30fps 推帧成两个自由时钟，相位差最多一整帧且拍频跳帧，肉眼可见一个图标恒定慢半拍——勿回退）
 - **状态占位图标** — `placeholderContext(symbol)` 生成深灰底 + 白色 SF Symbol 的 128×128 帧；master 的 `broadcastPlaceholder` 同时设自己图标并写入所有 viewer shm。启动 hourglass、无 adb 设备 / masterFail 时 iphone.slash、熄屏时显示伪装图标（Phone/Photos，`broadcastSleepCamo`）。
 - `start.sh` — 循环体内每轮读配置数、重启 viewers、运行 master：master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。Settings Apply 也以 exit(2) 走此路径热生效（含窗口数变化）。
