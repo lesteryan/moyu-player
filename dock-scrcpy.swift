@@ -56,6 +56,7 @@ func boundingBox(_ crops: [CropRect]) -> CropRect {
 }
 
 var turnScreenOffOnStart = true
+var devicePreference = "auto"  // "auto" | "ios" | "android"
 
 func loadConfig() -> [CropRect] {
     guard let data = FileManager.default.contents(atPath: configPath) else {
@@ -63,6 +64,7 @@ func loadConfig() -> [CropRect] {
     }
     if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         if let v = json["turnScreenOff"] as? Bool { turnScreenOffOnStart = v }
+        if let v = json["device"] as? String { devicePreference = v }
         if let arr = json["windows"] as? [[String: Any]] {
             let crops = arr.compactMap { CropRect.from($0) }
             if !crops.isEmpty { return crops }
@@ -79,10 +81,11 @@ func loadConfig() -> [CropRect] {
 }
 
 func saveConfig(_ crops: [CropRect]) {
-    let obj: [String: Any] = [
+    var obj: [String: Any] = [
         "windows": crops.map(\.dict),
         "turnScreenOff": turnScreenOffOnStart,
     ]
+    if devicePreference != "auto" { obj["device"] = devicePreference }
     guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
     try? data.write(to: URL(fileURLWithPath: configPath))
 }
@@ -370,9 +373,14 @@ func stopScrcpy() {
 // recovery from a poisoned SCK connection.
 func masterFail(_ reason: String) -> Never {
     log("FATAL: \(reason) — exiting for restart")
-    masterRenderer?.broadcastPlaceholder("iphone.slash")  // viewers show disconnect, not a frozen frame
+    masterRenderer?.broadcastPlaceholder("iphone.slash")
     dropDockTile()
-    stopScrcpy()
+    if isiOSMode {
+        iosSession?.stopRunning()
+        iosSession = nil
+    } else {
+        stopScrcpy()
+    }
     exit(2)
 }
 
@@ -414,13 +422,23 @@ final class MasterRenderer: NSObject, SCStreamOutput, AVCaptureVideoDataOutputSa
 
     func processFrame(_ ci: CIImage) {
         frameCount += 1
+        let fw = Int(ci.extent.width), fh = Int(ci.extent.height)
         if !loggedFirstFrame {
             loggedFirstFrame = true
-            log("first frame: \(Int(ci.extent.width))x\(Int(ci.extent.height))")
+            log("first frame: \(fw)x\(fh)")
             if isiOSMode {
-                bboxOverride = CropRect(w: Int(ci.extent.width), h: Int(ci.extent.height), x: 0, y: 0)
+                bboxOverride = CropRect(w: fw, h: fh, x: 0, y: 0)
                 log("iOS bbox set to full screen: \(bboxOverride!.string)")
+                for (i, crop) in crops.enumerated() {
+                    if crop.x + crop.w > fw || crop.y + crop.h > fh {
+                        log("WARNING: crop[\(i)] \(crop.string) exceeds device \(fw)x\(fh) — will be clamped")
+                    }
+                }
             }
+        }
+        if isiOSMode && (bboxOverride?.w != fw || bboxOverride?.h != fh) {
+            bboxOverride = CropRect(w: fw, h: fh, x: 0, y: 0)
+            log("iOS bbox updated: \(fw)x\(fh)")
         }
         let activeBBox = bboxOverride ?? bbox
         for (i, crop) in crops.enumerated() {
@@ -523,7 +541,11 @@ func findiOSDevice() -> AVCaptureDevice? {
 
 var iosSession: AVCaptureSession?
 
-func startiOSCapture() -> Bool {
+func startiOSCapture() async -> Bool {
+    guard devicePreference != "android" else {
+        log("device preference is android — skipping iOS detection")
+        return false
+    }
     guard let device = findiOSDevice() else { return false }
     log("iOS device found: \(device.localizedName) (\(device.modelID))")
 
@@ -548,21 +570,45 @@ func startiOSCapture() -> Bool {
     }
     session.addOutput(output)
     session.startRunning()
-    iosSession = session
-    log("iOS capture started")
+    log("iOS capture session started — waiting for first frame...")
 
-    // Set bbox to full device screen on first frame — we use a watchdog
-    // to detect the actual resolution and update bboxOverride.
-    Task { @MainActor in
-        try? await Task.sleep(nanoseconds: 4_000_000_000)
-        if masterRenderer!.frameCount == 0 {
-            log("no frames from iOS device after 4s")
-            session.stopRunning()
-            iosSession = nil
-            masterFail("iOS capture failed — no frames")
-        }
+    // Async-wait for first frame: if the device needs "Trust This Computer"
+    // or is otherwise unresponsive, we fall back to Android instead of
+    // entering a restart loop.
+    for _ in 0..<50 {
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        if masterRenderer!.frameCount > 0 { break }
     }
+    if masterRenderer!.frameCount == 0 {
+        log("no frames from iOS device after 5s — falling back to Android")
+        session.stopRunning()
+        return false
+    }
+
+    iosSession = session
+    log("iOS capture confirmed (\(masterRenderer!.frameCount) frames)")
     return true
+}
+
+func startiOSWatchdog() {
+    var lastCount = masterRenderer!.frameCount
+    var staleChecks = 0
+    let t = Timer(timeInterval: 5, repeats: true) { _ in
+        let cur = masterRenderer!.frameCount
+        if cur == lastCount {
+            staleChecks += 1
+            if staleChecks >= 2 {
+                log("iOS capture stale for 10s — restarting")
+                iosSession?.stopRunning()
+                iosSession = nil
+                masterFail("iOS device disconnected")
+            }
+        } else {
+            staleChecks = 0
+        }
+        lastCount = cur
+    }
+    RunLoop.main.add(t, forMode: .common)
 }
 
 var isiOSMode = false
@@ -1086,7 +1132,6 @@ var settingsController: SettingsWindowController?
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
-        if isMaster { setupMenu() }
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !isiOSMode {
@@ -1110,14 +1155,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var screenToggleItem: NSMenuItem!
 
-    private func setupMenu() {
+    func setupMenu() {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        screenToggleItem = NSMenuItem(title: deviceScreenIsOff ? "亮屏" : "黑屏",
-                                      action: #selector(toggleScreen), keyEquivalent: "d")
-        appMenu.addItem(screenToggleItem)
-        appMenu.addItem(.separator())
+        if !isiOSMode {
+            screenToggleItem = NSMenuItem(title: deviceScreenIsOff ? "亮屏" : "黑屏",
+                                          action: #selector(toggleScreen), keyEquivalent: "d")
+            appMenu.addItem(screenToggleItem)
+            appMenu.addItem(.separator())
+        }
         appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit dock-scrcpy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -1167,8 +1214,9 @@ sigtermSrc.resume()
 if isMaster {
     Task { @MainActor in
         masterRenderer?.broadcastPlaceholder("hourglass")
-        if startiOSCapture() {
+        if await startiOSCapture() {
             isiOSMode = true
+            startiOSWatchdog()
             log("running in iOS mode (no scrcpy, no adb)")
         } else {
             log("no iOS device — falling back to Android/scrcpy")
@@ -1179,6 +1227,7 @@ if isMaster {
             await startCapture()
             startScreenStatePolling()
         }
+        appDel.setupMenu()
     }
 } else {
     DispatchQueue.main.async { viewerLoop() }
