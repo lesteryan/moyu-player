@@ -278,27 +278,45 @@ func waitForAdbDevice() async {
 
 // MARK: - Device screen on/off (master only)
 
+// Panel-only off (device stays Awake, scrcpy keeps streaming) — the same call
+// scrcpy-server makes for --turn-screen-off. Runtime toggling can't go through
+// scrcpy's MOD+o shortcut: CGEvents posted to its background SDL window never
+// reach it (verified, even with a full LAlt flagsChanged sequence). Instead run
+// a tiny dex (screen-power/ScreenPower.java) via app_process that calls
+// scrcpy-server's Device.setDisplayPower by reflection. Both jars are pushed
+// under our own names: scrcpy deletes its server jar right after startup.
+// Note: adb can't read this panel state (SurfaceFlinger still says powerMode=On,
+// wakefulness stays Awake), so we track it ourselves.
 var deviceScreenIsOff = false
 
-func turnDeviceScreenOff() {
-    guard !deviceScreenIsOff else { return }
-    let out = runAdb(["shell", "dumpsys", "power"])
-    if out.contains("mWakefulness=Awake") {
-        runAdb(["shell", "input", "keyevent", "26"])  // POWER key
-    }
-    deviceScreenIsOff = true
-    log("device screen turned off")
+let screenPowerJar = "/data/local/tmp/dock-scrcpy-power.jar"
+let screenPowerServerJar = "/data/local/tmp/dock-scrcpy-server.jar"
+
+func pushScreenPowerJars() {
+    let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        .deletingLastPathComponent().path
+    runAdb(["push", execDir + "/screen-power/screen-power.jar", screenPowerJar])
+    runAdb(["push", scrcpyDir + "/x/server/scrcpy-server", screenPowerServerJar])
 }
 
-func turnDeviceScreenOn() {
-    guard deviceScreenIsOff else { return }
-    let out = runAdb(["shell", "dumpsys", "power"])
-    if !out.contains("mWakefulness=Awake") {
-        runAdb(["shell", "input", "keyevent", "26"])  // POWER key
+// Idempotent: menu actions don't trust deviceScreenIsOff (a physical power-key
+// press changes the panel behind our back), they just apply the wanted state.
+func setDevicePanel(on: Bool) {
+    let out = runAdb(["shell", "CLASSPATH=\(screenPowerJar):\(screenPowerServerJar)",
+                      "app_process", "/", "ScreenPower", on ? "on" : "off"])
+    if out.contains("= true") {
+        log("device panel turned \(on ? "on" : "off")")
+    } else {
+        // Fallback: real power key (sleep/wake); the poller then pauses/resumes capture.
+        log("setDisplayPower failed (\(out.trimmingCharacters(in: .whitespacesAndNewlines))) — falling back to POWER key")
+        let awake = runAdb(["shell", "dumpsys", "power"]).contains("mWakefulness=Awake")
+        if awake != on { runAdb(["shell", "input", "keyevent", "26"]) }
     }
-    deviceScreenIsOff = false
-    log("device screen turned on")
+    deviceScreenIsOff = !on
 }
+
+func turnDeviceScreenOff() { setDevicePanel(on: false) }
+func turnDeviceScreenOn() { setDevicePanel(on: true) }
 
 // MARK: - Scrcpy process (master only)
 
@@ -742,9 +760,11 @@ func startCapture() async {
 
 // Poll device screen state via adb; when the screen is off, stop the capture
 // stream (saves CPU/GPU) and show a moon placeholder. Resume when it's back on.
+// Driven by mWakefulness, i.e. real sleep (physical power key / POWER fallback).
+// Our panel-only off keeps the device Awake, so it never trips this — and an
+// Awake poll must not clear deviceScreenIsOff (that used to desync the menu).
 func setScreenState(awake: Bool) {
     if !awake && !screenOffPaused && activeStream != nil {
-        if deviceScreenIsOff { return }  // we turned it off; scrcpy keeps streaming
         screenOffPaused = true
         let s = activeStream
         activeStream = nil
@@ -753,13 +773,9 @@ func setScreenState(awake: Bool) {
         log("device screen off — capture paused")
     } else if awake && screenOffPaused {
         screenOffPaused = false
-        deviceScreenIsOff = false
-        (NSApp.delegate as? AppDelegate)?.updateScreenToggleTitle()
+        deviceScreenIsOff = false  // waking from sleep powers the panel back on
         log("device screen on — resuming capture")
         Task { @MainActor in await startCapture() }
-    } else if awake && deviceScreenIsOff {
-        deviceScreenIsOff = false
-        (NSApp.delegate as? AppDelegate)?.updateScreenToggleTitle()
     }
 }
 
@@ -1180,16 +1196,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private var screenToggleItem: NSMenuItem!
+    private var screenOffItem: NSMenuItem!
+    private var screenOnItem: NSMenuItem!
 
     func setupMenu() {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
         if !isiOSMode {
-            screenToggleItem = NSMenuItem(title: deviceScreenIsOff ? "亮屏" : "黑屏",
-                                          action: #selector(toggleScreen), keyEquivalent: "d")
-            appMenu.addItem(screenToggleItem)
+            screenOffItem = NSMenuItem(title: "黑屏", action: #selector(doScreenOff), keyEquivalent: "d")
+            screenOnItem = NSMenuItem(title: "亮屏", action: #selector(doScreenOn), keyEquivalent: "d")
+            screenOnItem.keyEquivalentModifierMask = [.command, .shift]
+            appMenu.addItem(screenOffItem)
+            appMenu.addItem(screenOnItem)
             appMenu.addItem(.separator())
         }
         appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
@@ -1200,21 +1219,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
-    func updateScreenToggleTitle() {
-        screenToggleItem?.title = deviceScreenIsOff ? "亮屏" : "黑屏"
+    @objc func doScreenOff() {
+        DispatchQueue.global().async { turnDeviceScreenOff() }
     }
 
-    @objc func toggleScreen() {
-        DispatchQueue.global().async {
-            if deviceScreenIsOff {
-                turnDeviceScreenOn()
-            } else {
-                turnDeviceScreenOff()
-            }
-            DispatchQueue.main.async { [self] in
-                updateScreenToggleTitle()
-            }
-        }
+    @objc func doScreenOn() {
+        DispatchQueue.global().async { turnDeviceScreenOn() }
     }
 
     @objc func openSettings() {
@@ -1250,6 +1260,7 @@ if isMaster {
             log("no iOS device — falling back to Android/scrcpy")
             await killStaleScrcpy()
             await waitForAdbDevice()
+            pushScreenPowerJars()
             if turnScreenOffOnStart { deviceScreenIsOff = true }
             launchScrcpy()
             await startCapture()

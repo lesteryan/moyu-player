@@ -14,6 +14,8 @@ swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit -framewor
 
 ## 依赖
 
+- `screen-power/screen-power.jar`：黑屏切换用的 dex（仓库里放的是预编译版）。改了 `ScreenPower.java` 需重编：`javac --release 11 -cp $ANDROID_SDK/platforms/android-36/android.jar -d /tmp/sp ScreenPower.java && d8 --min-api 21 --output /tmp/sp /tmp/sp/ScreenPower.class && (cd /tmp/sp && zip screen-power.jar classes.dex)`
+
 - Android 模式：依赖 `../3rd/android-testing/scrcpy` 下的本地 scrcpy 构建（通过 `./run` 脚本启动），可用 `SCRCPY_DIR` 环境变量覆盖路径，需要 USB 连接的 Android 设备（adb）
 - iPhone 模式：需要 USB 连接的 iPhone/iPad，无需额外工具（AVFoundation + CoreMediaIO 直接捕获）
 - 启动时自动检测：优先找 iPhone/iPad，没有则走 Android
@@ -37,11 +39,14 @@ master/viewer + 共享内存。两种捕获模式自动切换：
 - **状态占位图标** — `placeholderContext(symbol)` 生成深灰底 + 白色 SF Symbol 的 128×128 帧；master 的 `broadcastPlaceholder` 同时设自己图标并写入所有 viewer shm。启动 hourglass、无 adb 设备 / masterFail 时 iphone.slash、熄屏时显示伪装图标（Phone/Photos，`broadcastSleepCamo`）。
 - `start.sh` — 循环体内每轮读配置数、**先起 master 并等它在 LaunchServices 里变成 Foreground（`lsappinfo`），再依次起 viewer**（Dock 按注册顺序从左往右排，先起 viewer 会导致左右画面颠倒），停 viewer 时 `wait` 到真正退出（否则新 viewer 撞单例锁）。master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。Settings Apply 也以 exit(2) 走此路径热生效（含窗口数变化）。
 - **断连自愈** — scrcpy 退出（如 USB 断开）→ master exit(2) → start.sh 重启；新 master 启动前先等 adb 有设备：无设备则 `adb kill-server` + `start-server`，等 10 秒重试，循环直到设备回来。
-- **手机黑屏控制** — 配置项 `turnScreenOff`（Settings 里"启动时关闭手机屏幕"复选框）决定 scrcpy 是否带 `--turn-screen-off`。菜单"黑屏/亮屏"（⌘D）可运行时切换：通过 `adb shell input keyevent 26`（POWER 键）开关物理屏。正常退出自动亮屏。配置项 `autoScreenOffMinutes`（Settings"自动黑屏"，0=禁用）：屏幕点亮 N 分钟后自动灭屏，每次亮屏（⌘D / 物理电源键）都重新计时。
+- **手机黑屏控制** — 配置项 `turnScreenOff`（Settings 里"启动时关闭手机屏幕"）决定 scrcpy 是否带 `--turn-screen-off`。菜单"黑屏"（⌘D）/"亮屏"（⌘⇧D）运行时切换：**只关面板、设备保持 Awake、投屏不断**，与启动时的黑屏同一机制——`adb shell CLASSPATH=dock-scrcpy-power.jar:dock-scrcpy-server.jar app_process / ScreenPower on|off`，`screen-power/ScreenPower.java` 反射调用 scrcpy-server 的 `Device.setDisplayPower`。两个 jar 由 master 启动时 push 到 `/data/local/tmp/`（scrcpy 启动后会删自己的 server jar，所以用自己的文件名）。调用失败才退回 `input keyevent 26`（真睡眠）。正常退出自动亮屏。
 - **重启退避** — start.sh 检测连续快速死亡（<30s）：连续 5 次后每轮 sleep 30s，避免持续性故障（如录屏权限被撤销）导致的重启风暴。
 - **熄屏心跳** — 熄屏暂停期间 master 每 5s 重新广播伪装图标（seq 递增），防止 viewer 的 10s 无帧检测误报断连。
 
 ### 捕获链路的坑（已修，勿回退）
+
+- **CGEvent `postToPid` 给 scrcpy 发 MOD+o 快捷键无效**（实测：AX 已授权、补全左 Alt flagsChanged 序列也不行，后台 SDL 窗口收不到）。黑屏切换必须走 `ScreenPower` dex，勿回退。
+- **adb 读不到"仅关面板"状态**：SurfaceFlinger `powerMode` 仍为 On、`mWakefulness` 仍为 Awake。面板状态只能自己记（`deviceScreenIsOff`），且 Awake 轮询不能清它（旧 bug：启动 5s 后状态被冲掉，"亮屏"点了直接 return）。
 
 - **scrcpy 窗口不能完全离屏**（如 `-32000`）：SDL/Metal 对不可见窗口跳过渲染，窗口不被合成，SCK 零帧（`screencapture -l` 也取不到图）。现在窗口留 1px 在屏幕右下角。
 - **scrcpy 自己的 Dock 图标**：用环境变量 `SDL_MAC_BACKGROUND_APP=1` 让 SDL 以 accessory 模式运行，不出现在 Dock。
@@ -52,14 +57,14 @@ master/viewer + 共享内存。两种捕获模式自动切换：
 
 ### Dock 本身的坑
 
+- **单例**：每个 index 启动即 `flock /tmp/dock-scrcpy-<i>.lock`（O_CLOEXEC，防 scrcpy 子进程继承），已被占用直接 exit(0)、不出 Dock 图标。防止误点 Dock/Finder 里的 exec 图标拉起第二个 master 杀掉正在跑的 scrcpy。
+- **SIGHUP 必须接管**：关闭跑 start.sh 的终端会发 HUP，默认动作直接杀进程、不摘 Dock 图标。现在 INT/TERM/HUP 都走 `NSApp.terminate`，start.sh 也 trap HUP。
+- **scrcpy 不理 SIGTERM**（实测 15s+ 仍存活），只发 TERM 会留孤儿 scrcpy（窗口同名，干扰下次 `findStableWindow`）。`killHard`：TERM → 1s 后仍活着就 SIGKILL，`stopScrcpy` / `killStaleScrcpy` 都走它。
+
 - **重启 Dock 会断开已运行进程的图标更新通道**（`applicationIconImage` 设了也不生效）。需要重启 Dock 时顺序必须是：停 dock-scrcpy → 重启 Dock → 再启动 dock-scrcpy。
 - **Dock "最近使用的 App" 区会堆积 exec 僵尸图标**（dock-scrcpy 每次退出都进 recents，且持久化、Dock 重启不清）。且 **Dock 被 SIGTERM 杀时会把内存里的旧配置回写 prefs**，覆盖掉 `defaults write`——改 Dock 配置必须 `defaults write` 后立刻 `kill -9 <Dock pid>`。当前已关闭 recents（恢复：`defaults write com.apple.dock show-recents -bool true`）。
 - **进程退出前先 `setActivationPolicy(.accessory)` 摘掉自己的 Dock 图标**，否则突然退出可能留 ghost tile。
 - **清理 scrcpy 必须递归杀进程树**（bash → run → scrcpy 三层）：启动初期 `scrcpyWindowPID` 尚未从窗口解析出来，只 terminate `Process` 句柄会留 scrcpy 孤儿（代码里 `processTree` + `killHard`）。
-
-- **单例**：每个 index 启动即 `flock /tmp/dock-scrcpy-<i>.lock`（O_CLOEXEC，防 scrcpy 子进程继承），已被占用直接 exit(0)、不出 Dock 图标。防止误点 Dock/Finder 里的 exec 图标拉起第二个 master 杀掉正在跑的 scrcpy。
-- **SIGHUP 必须接管**：关闭跑 start.sh 的终端会发 HUP，默认动作直接杀进程、不摘 Dock 图标。现在 INT/TERM/HUP 都走 `NSApp.terminate`，start.sh 也 trap HUP。
-- **scrcpy 不理 SIGTERM**（实测 15s+ 仍存活），只发 TERM 会留孤儿 scrcpy（窗口同名，干扰下次 `findStableWindow`）。`killHard`：TERM → 1s 后仍活着就 SIGKILL，`stopScrcpy` / `killStaleScrcpy` 都走它。
 
 ## 配置
 
