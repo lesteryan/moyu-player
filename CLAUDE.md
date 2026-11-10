@@ -35,7 +35,7 @@ master/viewer + 共享内存。两种捕获模式自动切换：
 - **master (index 0)** — 自己的 crop 直接设为 Dock 图标，其余 crop 缩放到 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap，头部 seq 计数器）。管理 scrcpy 生命周期（Android 模式），提供 Settings 菜单（⌘,）。每 5s `adb shell dumpsys power` 轮询 `mWakefulness`（仅 Android 模式）：熄屏 → 停 SCStream 省电 + 广播伪装图标（index 0 → Phone.app、index 1+ → Photos.app 的系统图标，加载失败回退 moon）；亮屏 → 重新 startCapture（scheduleRetry 在 `screenOffPaused` 时被抑制，避免误重试）。
 - **viewer (index ≥1)** — 纯共享内存读取器，**120Hz 轮询 seq 头**（8 字节读，廉价），变化才拷贝像素并更新 Dock 图标；拷贝后复核 seq 防撕裂。**完全不碰 ScreenCaptureKit**。启动显示 hourglass 占位，10s 无新帧显示 iphone.slash。（曾用 30Hz 轮询：与 master 的 30fps 推帧成两个自由时钟，相位差最多一整帧且拍频跳帧，肉眼可见一个图标恒定慢半拍——勿回退）
 - **状态占位图标** — `placeholderContext(symbol)` 生成深灰底 + 白色 SF Symbol 的 128×128 帧；master 的 `broadcastPlaceholder` 同时设自己图标并写入所有 viewer shm。启动 hourglass、无 adb 设备 / masterFail 时 iphone.slash、熄屏时显示伪装图标（Phone/Photos，`broadcastSleepCamo`）。
-- `start.sh` — 循环体内每轮读配置数、重启 viewers、运行 master：master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。Settings Apply 也以 exit(2) 走此路径热生效（含窗口数变化）。
+- `start.sh` — 循环体内每轮读配置数、**先起 master 并等它在 LaunchServices 里变成 Foreground（`lsappinfo`），再依次起 viewer**（Dock 按注册顺序从左往右排，先起 viewer 会导致左右画面颠倒），停 viewer 时 `wait` 到真正退出（否则新 viewer 撞单例锁）。master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。Settings Apply 也以 exit(2) 走此路径热生效（含窗口数变化）。
 - **断连自愈** — scrcpy 退出（如 USB 断开）→ master exit(2) → start.sh 重启；新 master 启动前先等 adb 有设备：无设备则 `adb kill-server` + `start-server`，等 10 秒重试，循环直到设备回来。
 - **手机黑屏控制** — 配置项 `turnScreenOff`（Settings 里"启动时关闭手机屏幕"复选框）决定 scrcpy 是否带 `--turn-screen-off`。菜单"黑屏/亮屏"（⌘D）可运行时切换：通过 `adb shell input keyevent 26`（POWER 键）开关物理屏。正常退出自动亮屏。配置项 `autoScreenOffMinutes`（Settings"自动黑屏"，0=禁用）：屏幕点亮 N 分钟后自动灭屏，每次亮屏（⌘D / 物理电源键）都重新计时。
 - **重启退避** — start.sh 检测连续快速死亡（<30s）：连续 5 次后每轮 sleep 30s，避免持续性故障（如录屏权限被撤销）导致的重启风暴。
@@ -55,7 +55,11 @@ master/viewer + 共享内存。两种捕获模式自动切换：
 - **重启 Dock 会断开已运行进程的图标更新通道**（`applicationIconImage` 设了也不生效）。需要重启 Dock 时顺序必须是：停 dock-scrcpy → 重启 Dock → 再启动 dock-scrcpy。
 - **Dock "最近使用的 App" 区会堆积 exec 僵尸图标**（dock-scrcpy 每次退出都进 recents，且持久化、Dock 重启不清）。且 **Dock 被 SIGTERM 杀时会把内存里的旧配置回写 prefs**，覆盖掉 `defaults write`——改 Dock 配置必须 `defaults write` 后立刻 `kill -9 <Dock pid>`。当前已关闭 recents（恢复：`defaults write com.apple.dock show-recents -bool true`）。
 - **进程退出前先 `setActivationPolicy(.accessory)` 摘掉自己的 Dock 图标**，否则突然退出可能留 ghost tile。
-- **清理 scrcpy 必须递归杀进程树**（bash → run → scrcpy 三层）：启动初期 `scrcpyWindowPID` 尚未从窗口解析出来，只 terminate `Process` 句柄会留 scrcpy 孤儿（代码里 `killTree`）。
+- **清理 scrcpy 必须递归杀进程树**（bash → run → scrcpy 三层）：启动初期 `scrcpyWindowPID` 尚未从窗口解析出来，只 terminate `Process` 句柄会留 scrcpy 孤儿（代码里 `processTree` + `killHard`）。
+
+- **单例**：每个 index 启动即 `flock /tmp/dock-scrcpy-<i>.lock`（O_CLOEXEC，防 scrcpy 子进程继承），已被占用直接 exit(0)、不出 Dock 图标。防止误点 Dock/Finder 里的 exec 图标拉起第二个 master 杀掉正在跑的 scrcpy。
+- **SIGHUP 必须接管**：关闭跑 start.sh 的终端会发 HUP，默认动作直接杀进程、不摘 Dock 图标。现在 INT/TERM/HUP 都走 `NSApp.terminate`，start.sh 也 trap HUP。
+- **scrcpy 不理 SIGTERM**（实测 15s+ 仍存活），只发 TERM 会留孤儿 scrcpy（窗口同名，干扰下次 `findStableWindow`）。`killHard`：TERM → 1s 后仍活着就 SIGKILL，`stopScrcpy` / `killStaleScrcpy` 都走它。
 
 ## 配置
 

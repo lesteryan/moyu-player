@@ -103,6 +103,20 @@ guard myIndex < allCrops.count else {
     exit(1)
 }
 
+// Single instance per index: a stray launch (clicking a leftover exec tile in
+// the Dock, Finder, a second start.sh) would otherwise start a second master
+// that kills the running scrcpy. flock is released by the kernel on any exit,
+// so restarts never see a stale lock. O_CLOEXEC: scrcpy children must not
+// inherit it, or an orphaned scrcpy would block the next master.
+let instanceLockFD: Int32 = {
+    let fd = open("/tmp/dock-scrcpy-\(myIndex).lock", O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+    if fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0 {
+        FileHandle.standardError.write(Data("dock-scrcpy[\(myIndex)]: already running — exiting\n".utf8))
+        exit(0)
+    }
+    return fd
+}()
+
 let bbox = boundingBox(allCrops)
 
 func log(_ s: String) { FileHandle.standardError.write(Data("dock-scrcpy[\(myIndex)]: \(s)\n".utf8)) }
@@ -298,7 +312,7 @@ func killStaleScrcpy() async {
     for w in c.windows where w.title == scrcpyWindowTitle {
         if let pid = w.owningApplication?.processID {
             log("killing stale scrcpy pid \(pid)")
-            kill(pid, SIGTERM)
+            killHard([pid])
             killed = true
         }
     }
@@ -343,10 +357,27 @@ func dropDockTile() {
     NSApp.setActivationPolicy(.accessory)
 }
 
-// Kill a process and all its descendants (bash → run → scrcpy chain).
-// Killing only the Process handle orphans scrcpy if it hasn't been resolved
-// from the captured window yet (early startup).
-func killTree(_ pid: pid_t) {
+// scrcpy ignores SIGTERM (observed: still alive 15s later), so TERM first for
+// a clean shutdown, then SIGKILL whatever survives 1s. An orphaned scrcpy keeps
+// its window (same title) around and confuses the next master's window lookup.
+func killHard(_ pids: [pid_t]) {
+    let pids = pids.filter { $0 > 0 }
+    guard !pids.isEmpty else { return }
+    for pid in pids { kill(pid, SIGTERM) }
+    for _ in 0..<10 {
+        if pids.allSatisfy({ kill($0, 0) != 0 }) { return }
+        usleep(100_000)
+    }
+    for pid in pids where kill(pid, 0) == 0 {
+        log("pid \(pid) ignored SIGTERM — sending SIGKILL")
+        kill(pid, SIGKILL)
+    }
+}
+
+// A process and all its descendants (bash → run → scrcpy chain). Killing only
+// the Process handle orphans scrcpy if it hasn't been resolved from the
+// captured window yet (early startup).
+func processTree(_ pid: pid_t) -> [pid_t] {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
     p.arguments = ["-P", "\(pid)"]
@@ -355,18 +386,14 @@ func killTree(_ pid: pid_t) {
     try? p.run()
     p.waitUntilExit()
     let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    for child in out.split(separator: "\n").compactMap({ pid_t($0) }) {
-        killTree(child)
-    }
-    kill(pid, SIGTERM)
+    return out.split(separator: "\n").compactMap { pid_t($0) }.flatMap(processTree) + [pid]
 }
 
 func stopScrcpy() {
     scrcpyProc?.terminationHandler = nil  // avoid masterFail re-entry when we kill it ourselves
-    if scrcpyWindowPID > 0 { kill(scrcpyWindowPID, SIGTERM) }
-    if let proc = scrcpyProc, proc.isRunning {
-        killTree(proc.processIdentifier)
-    }
+    var pids = [scrcpyWindowPID]
+    if let proc = scrcpyProc, proc.isRunning { pids += processTree(proc.processIdentifier) }
+    killHard(Array(Set(pids)))
 }
 
 // Exit code 2 asks start.sh to restart us: a fresh process is the only reliable
@@ -1202,14 +1229,15 @@ let appDel = AppDelegate()
 app.delegate = appDel
 
 // Signal handling via DispatchSource (C signal handlers must not call dispatch APIs).
-signal(SIGINT, SIG_IGN)
-signal(SIGTERM, SIG_IGN)
-let sigintSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-sigintSrc.setEventHandler { NSApp.terminate(nil) }
-sigintSrc.resume()
-let sigtermSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-sigtermSrc.setEventHandler { NSApp.terminate(nil) }
-sigtermSrc.resume()
+// SIGHUP too: closing the terminal running start.sh sends HUP, whose default
+// action kills us without dropping the Dock tile → ghost tile left behind.
+let signalSources: [DispatchSourceSignal] = [SIGINT, SIGTERM, SIGHUP].map { sig in
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler { NSApp.terminate(nil) }
+    src.resume()
+    return src
+}
 
 if isMaster {
     Task { @MainActor in
