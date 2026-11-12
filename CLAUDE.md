@@ -83,6 +83,7 @@ master/viewer + 共享内存。两种捕获模式自动切换：
 - 每个 window 条目对应一个 Dock 图标实例的 crop 区域（Android 屏幕坐标）。**给正方形**：非正方形会被中心裁成正方形，等于浪费采样面积
 - 旧值备份在 `~/.config/dock-scrcpy.conf.bak`（267×534 竖条 ×2）
 - 通过 master 的 Settings 菜单（⌘,）修改：每个 Window 有"框选…"按钮，adb `screencap` 截手机屏幕后在截图上拖拽框选（强制正方形、自动 clamp 到屏幕内），Apply 后 exit(2) 由 start.sh 自动重启生效
+- 其他字段：`turnScreenOff`（Bool，启动时关面板）、`brightness`（Double，图标亮度增益 0.2–1.5，1.0 时不写）、`device`（`ios`/`android`，缺省 auto）
 - 兼容旧格式（每行一个 `W:H:X:Y`），首次读取自动迁移为 JSON
 
 已安装为 `/Applications/dock-scrcpy.app`（symlink wrapper + scrcpy 图标）。

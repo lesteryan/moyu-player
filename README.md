@@ -1,17 +1,17 @@
 # moyu-player
 
-macOS Dock 图标动态渲染实验：把 Android 投屏画面实时写入 Dock 图标。
+macOS Dock 图标动态渲染实验：把 Android / iPhone 投屏画面实时写入 Dock 图标。
 
 ## 工具
 
 | 工具 | 源码 | 功能 |
 |------|------|------|
-| `dock-scrcpy` | `dock-scrcpy.swift` | 通过 scrcpy 将 Android 设备画面投到 Dock 图标（可多图标拼接），基于 ScreenCaptureKit 捕获 scrcpy 窗口 |
+| `dock-scrcpy` | `dock-scrcpy.swift` | 将设备画面投到 Dock 图标（可多图标拼接）。Android 走 scrcpy + ScreenCaptureKit 捕获 scrcpy 窗口；iPhone/iPad 走 AVFoundation 直接捕获 USB 设备画面 |
 
 ## 构建
 
 ```bash
-swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit
+swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit -framework AVFoundation -framework CoreMediaIO
 ```
 
 ## 运行
@@ -22,7 +22,11 @@ swiftc -O -o dock-scrcpy dock-scrcpy.swift -framework ScreenCaptureKit
 ./dock-scrcpy 1           # 单独启动 viewer
 ```
 
-依赖：本地 scrcpy 构建（默认 `../3rd/android-testing/scrcpy`，可用 `SCRCPY_DIR` 环境变量覆盖）+ USB 连接的 Android 设备（adb）。
+依赖：
+
+- Android：本地 scrcpy 构建（默认 `../3rd/android-testing/scrcpy`，可用 `SCRCPY_DIR` 环境变量覆盖）+ USB 连接的设备（adb）
+- iPhone/iPad：USB 连接即可，无需额外工具
+- 启动时自动检测，优先 iOS 设备，没有则走 Android
 
 ## dock-scrcpy 架构
 
@@ -31,9 +35,17 @@ master/viewer + 共享内存，单 SCStream：
 - **master (index 0)** — 计算所有 crop 的 bounding box，启动 scrcpy 带 `--crop=bbox`（服务端第一次裁剪），用单条 SCStream 捕获 scrcpy 窗口并渲染所有 crop：自己的 crop 直接设为 Dock 图标，其余缩放为 128×128 BGRA 写入 `/tmp/dock-scrcpy-frame-<i>.raw`（mmap + seq 头）。管理 scrcpy 生命周期，提供 Settings 菜单（⌘,）。每 5s 轮询设备屏幕状态：熄屏时停流省电并伪装图标，亮屏自动恢复。
 - **viewer (index ≥1)** — 纯共享内存读取器，120Hz 轮询 seq 头（8 字节读，廉价），变化时才拷贝像素并更新自己的 Dock 图标，完全不使用 ScreenCaptureKit。
 - **状态占位图标** — 等待时 hourglass、设备断连时 iphone.slash、熄屏时伪装成 Phone/Photos 系统图标，不再冻结最后一帧。
-- **省电** — scrcpy 可带 `--turn-screen-off` 物理灭屏（Settings 可配），支持自动黑屏定时（N 分钟后灭屏）。设备熄屏时自动停流，亮屏恢复。
+- **省电** — 设备熄屏时自动停流，亮屏恢复。
+- **iOS 模式** — 检测到 USB iPhone/iPad 时用 AVFoundation 直接捕获，不需要 scrcpy/adb；无触控反馈。
 - **断连自愈** — USB 断开时 master 退出重启，新 master 每 10s 重启 adb server 并重试，循环直到设备回来。
 - `start.sh` — 循环运行 master，每轮按配置重启 viewers；master 以退出码 2 请求重启（换新进程是修复 SCK 中毒连接的唯一可靠手段，Settings Apply 也走此路径热生效）。
+
+## 菜单（master）
+
+- **黑屏 / 亮屏（⌘D）** — 单个切换项，只关手机面板、设备保持唤醒、投屏不断。标题随当前状态变化（从 `dumpsys SurfaceFlinger` 读内置屏 `powerMode`）。启动时是否黑屏由 Settings 里"启动时关闭手机屏幕"决定。仅 Android。
+- **图标亮度滑块** — 调整 Dock 图标画面的明暗（0.2–1.5），纯本地渲染，不改手机亮度，自动保存。
+- **Settings…（⌘,）** — 编辑 crop 区域等配置。
+- 点击 Dock 图标 → 点按对应 crop 中心（暂停/播放，仅 Android）。
 
 ## 配置
 
@@ -44,9 +56,15 @@ master/viewer + 共享内存，单 SCStream：
   "windows": [
     {"w": 562, "h": 562, "x": 34, "y": 250},
     {"w": 562, "h": 562, "x": 624, "y": 250}
-  ]
+  ],
+  "turnScreenOff": true,
+  "brightness": 0.8
 }
 ```
+
+- `turnScreenOff`：启动时是否关闭手机面板
+- `brightness`：图标亮度增益（可选，默认 1.0，由菜单滑块写入）
+- `device`：可选，`ios` / `android` 强制设备类型，默认自动
 
 可通过 master 的 Settings 菜单（⌘,）修改：每个 Window 旁的"框选…"按钮会 adb 截图手机屏幕，在截图上拖拽即可框出正方形 crop；Apply 后自动重启生效（经 start.sh 运行时）。
 
