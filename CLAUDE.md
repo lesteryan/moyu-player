@@ -39,14 +39,15 @@ master/viewer + 共享内存。两种捕获模式自动切换：
 - **状态占位图标** — `placeholderContext(symbol)` 生成深灰底 + 白色 SF Symbol 的 128×128 帧；master 的 `broadcastPlaceholder` 同时设自己图标并写入所有 viewer shm。启动 hourglass、无 adb 设备 / masterFail 时 iphone.slash、熄屏时显示伪装图标（Phone/Photos，`broadcastSleepCamo`）。
 - `start.sh` — 循环体内每轮读配置数、**先起 master 并等它在 LaunchServices 里变成 Foreground（`lsappinfo`），再依次起 viewer**（Dock 按注册顺序从左往右排，先起 viewer 会导致左右画面颠倒），停 viewer 时 `wait` 到真正退出（否则新 viewer 撞单例锁）。master 以退出码 2 请求重启（新进程是修复 SCK 中毒连接的唯一可靠手段）。Settings Apply 也以 exit(2) 走此路径热生效（含窗口数变化）。
 - **断连自愈** — scrcpy 退出（如 USB 断开）→ master exit(2) → start.sh 重启；新 master 启动前先等 adb 有设备：无设备则 `adb kill-server` + `start-server`，等 10 秒重试，循环直到设备回来。
-- **手机黑屏控制** — 配置项 `turnScreenOff`（Settings 里"启动时关闭手机屏幕"）决定 scrcpy 是否带 `--turn-screen-off`。菜单"黑屏"（⌘D）/"亮屏"（⌘⇧D）运行时切换：**只关面板、设备保持 Awake、投屏不断**，与启动时的黑屏同一机制——`adb shell CLASSPATH=dock-scrcpy-power.jar:dock-scrcpy-server.jar app_process / ScreenPower on|off`，`screen-power/ScreenPower.java` 反射调用 scrcpy-server 的 `Device.setDisplayPower`。两个 jar 由 master 启动时 push 到 `/data/local/tmp/`（scrcpy 启动后会删自己的 server jar，所以用自己的文件名）。调用失败才退回 `input keyevent 26`（真睡眠）。正常退出自动亮屏。
+- **手机黑屏控制** — 配置项 `turnScreenOff`（Settings 里"启动时关闭手机屏幕"）决定 scrcpy 是否带 `--turn-screen-off`。菜单单个切换项（⌘D，标题随状态显示"黑屏"/"亮屏"，未知时"切换黑屏"；点击时现查设备真值再取反）运行时切换：**只关面板、设备保持 Awake、投屏不断**，与启动时的黑屏同一机制——`adb shell CLASSPATH=dock-scrcpy-power.jar:dock-scrcpy-server.jar app_process / ScreenPower on|off`，`screen-power/ScreenPower.java` 反射调用 scrcpy-server 的 `Device.setDisplayPower`。两个 jar 由 master 启动时 push 到 `/data/local/tmp/`（scrcpy 启动后会删自己的 server jar，所以用自己的文件名）。调用失败才退回 `input keyevent 26`（真睡眠）。正常退出自动亮屏。
+- **图标亮度** — master 菜单里的滑块（0.2–1.5，默认 1.0），渲染时对每帧做 `CIColorMatrix` RGB 增益，viewer 经 shm 拿到的是调好的像素。纯本地，不碰手机亮度；松手时写入配置 `brightness`（为 1.0 时不写）。音量没做：scrcpy 没有音量参数，要做得 patch scrcpy 的 SDL3 `SDL_SetAudioStreamGain` + 运行时通道，暂不弄。
 - **重启退避** — start.sh 检测连续快速死亡（<30s）：连续 5 次后每轮 sleep 30s，避免持续性故障（如录屏权限被撤销）导致的重启风暴。
 - **熄屏心跳** — 熄屏暂停期间 master 每 5s 重新广播伪装图标（seq 递增），防止 viewer 的 10s 无帧检测误报断连。
 
 ### 捕获链路的坑（已修，勿回退）
 
 - **CGEvent `postToPid` 给 scrcpy 发 MOD+o 快捷键无效**（实测：AX 已授权、补全左 Alt flagsChanged 序列也不行，后台 SDL 窗口收不到）。黑屏切换必须走 `ScreenPower` dex，勿回退。
-- **adb 读不到"仅关面板"状态**：SurfaceFlinger `powerMode` 仍为 On、`mWakefulness` 仍为 Awake。面板状态只能自己记（`deviceScreenIsOff`），且 Awake 轮询不能清它（旧 bug：启动 5s 后状态被冲掉，"亮屏"点了直接 return）。
+- **"仅关面板"状态的读法**：`mWakefulness` 仍为 Awake，读不出来；要看 `dumpsys SurfaceFlinger --displays` 里 **`connectionType=Internal` 那块**的 `powerMode`（Off/On 会跟着翻）。scrcpy 的虚拟屏 `name="scrcpy"` 永远是 On，别匹配错（旧结论"读不到"就是看错了 display）。master 5s 轮询顺带读，存 `devicePanelOn`（nil=未知）；菜单切换项标题据此更新（`validateMenuItem`）。
 
 - **scrcpy 窗口不能完全离屏**（如 `-32000`）：SDL/Metal 对不可见窗口跳过渲染，窗口不被合成，SCK 零帧（`screencapture -l` 也取不到图）。现在窗口留 1px 在屏幕右下角。
 - **scrcpy 自己的 Dock 图标**：用环境变量 `SDL_MAC_BACKGROUND_APP=1` 让 SDL 以 accessory 模式运行，不出现在 Dock。

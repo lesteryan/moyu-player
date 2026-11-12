@@ -57,6 +57,11 @@ func boundingBox(_ crops: [CropRect]) -> CropRect {
 
 var turnScreenOffOnStart = true
 var devicePreference = "auto"  // "auto" | "ios" | "android"
+// Icon brightness gain applied when rendering (master only; viewers get the
+// already-adjusted pixels via shm). Local only — the phone is never touched.
+// Written on main (menu slider), read on captureQueue — a torn read is harmless.
+var iconBrightness = 1.0
+let iconBrightnessRange = 0.2...1.5
 
 func loadConfig() -> [CropRect] {
     guard let data = FileManager.default.contents(atPath: configPath) else {
@@ -65,6 +70,7 @@ func loadConfig() -> [CropRect] {
     if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         if let v = json["turnScreenOff"] as? Bool { turnScreenOffOnStart = v }
         if let v = json["device"] as? String { devicePreference = v }
+        if let v = json["brightness"] as? Double { iconBrightness = min(max(v, iconBrightnessRange.lowerBound), iconBrightnessRange.upperBound) }
         if let arr = json["windows"] as? [[String: Any]] {
             let crops = arr.compactMap { CropRect.from($0) }
             if !crops.isEmpty { return crops }
@@ -86,6 +92,7 @@ func saveConfig(_ crops: [CropRect]) {
         "turnScreenOff": turnScreenOffOnStart,
     ]
     if devicePreference != "auto" { obj["device"] = devicePreference }
+    if iconBrightness != 1.0 { obj["brightness"] = iconBrightness }
     guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
     try? data.write(to: URL(fileURLWithPath: configPath))
 }
@@ -285,9 +292,20 @@ func waitForAdbDevice() async {
 // a tiny dex (screen-power/ScreenPower.java) via app_process that calls
 // scrcpy-server's Device.setDisplayPower by reflection. Both jars are pushed
 // under our own names: scrcpy deletes its server jar right after startup.
-// Note: adb can't read this panel state (SurfaceFlinger still says powerMode=On,
-// wakefulness stays Awake), so we track it ourselves.
-var deviceScreenIsOff = false
+// Panel state is invisible to `dumpsys power` (wakefulness stays Awake) but the
+// *Internal* display's powerMode in `dumpsys SurfaceFlinger --displays` flips
+// On/Off. (scrcpy's own "scrcpy" virtual display always reads On — don't match it.)
+// nil = unknown (no device / unrecognized dump) → menu enables both items.
+// Main-thread only.
+var devicePanelOn: Bool? = nil
+
+func queryDevicePanelOn() -> Bool? {
+    let out = runAdb(["shell", "dumpsys", "SurfaceFlinger", "--displays"])
+    guard let d = out.range(of: "connectionType=Internal"),
+          let p = out[d.upperBound...].range(of: "powerMode=") else { return nil }
+    let mode = out[p.upperBound...].prefix { !$0.isWhitespace }
+    return mode.hasPrefix("On")  // On / OnSuspend lit; Off / Doze / DozeSuspend dark
+}
 
 let screenPowerJar = "/data/local/tmp/dock-scrcpy-power.jar"
 let screenPowerServerJar = "/data/local/tmp/dock-scrcpy-server.jar"
@@ -299,8 +317,7 @@ func pushScreenPowerJars() {
     runAdb(["push", scrcpyDir + "/x/server/scrcpy-server", screenPowerServerJar])
 }
 
-// Idempotent: menu actions don't trust deviceScreenIsOff (a physical power-key
-// press changes the panel behind our back), they just apply the wanted state.
+// Idempotent: just applies the wanted state; the 5s poll re-reads the truth.
 func setDevicePanel(on: Bool) {
     let out = runAdb(["shell", "CLASSPATH=\(screenPowerJar):\(screenPowerServerJar)",
                       "app_process", "/", "ScreenPower", on ? "on" : "off"])
@@ -312,10 +329,10 @@ func setDevicePanel(on: Bool) {
         let awake = runAdb(["shell", "dumpsys", "power"]).contains("mWakefulness=Awake")
         if awake != on { runAdb(["shell", "input", "keyevent", "26"]) }
     }
-    deviceScreenIsOff = !on
+    let actual = queryDevicePanelOn()
+    DispatchQueue.main.async { devicePanelOn = actual ?? on }
 }
 
-func turnDeviceScreenOff() { setDevicePanel(on: false) }
 func turnDeviceScreenOn() { setDevicePanel(on: true) }
 
 // MARK: - Scrcpy process (master only)
@@ -558,6 +575,14 @@ final class MasterRenderer: NSObject, SCStreamOutput, AVCaptureVideoDataOutputSa
         var img = cropped.transformed(by: CGAffineTransform(scaleX: s, y: s))
         img = img.transformed(by: CGAffineTransform(translationX: -img.extent.origin.x,
                                                     y: -img.extent.origin.y))
+        let gain = CGFloat(iconBrightness)
+        if gain != 1 {  // scale RGB, keep alpha; >1 clips at white on BGRA8 render
+            img = img.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: gain, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: gain, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: gain, w: 0),
+            ])
+        }
         ctx.render(img, toBitmap: dst, rowBytes: iconSize * 4,
                    bounds: CGRect(x: 0, y: 0, width: iconSize, height: iconSize),
                    format: .BGRA8, colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -761,8 +786,8 @@ func startCapture() async {
 // Poll device screen state via adb; when the screen is off, stop the capture
 // stream (saves CPU/GPU) and show a moon placeholder. Resume when it's back on.
 // Driven by mWakefulness, i.e. real sleep (physical power key / POWER fallback).
-// Our panel-only off keeps the device Awake, so it never trips this — and an
-// Awake poll must not clear deviceScreenIsOff (that used to desync the menu).
+// Our panel-only off keeps the device Awake, so it never trips this; panel
+// state for the menu is polled separately (queryDevicePanelOn).
 func setScreenState(awake: Bool) {
     if !awake && !screenOffPaused && activeStream != nil {
         screenOffPaused = true
@@ -773,7 +798,6 @@ func setScreenState(awake: Bool) {
         log("device screen off — capture paused")
     } else if awake && screenOffPaused {
         screenOffPaused = false
-        deviceScreenIsOff = false  // waking from sleep powers the panel back on
         log("device screen on — resuming capture")
         Task { @MainActor in await startCapture() }
     }
@@ -788,7 +812,11 @@ func startScreenStatePolling() {
             let out = runAdb(["shell", "dumpsys", "power"])
             guard out.contains("mWakefulness=") else { return }  // no device / unknown format
             let awake = out.contains("mWakefulness=Awake")
-            DispatchQueue.main.async { setScreenState(awake: awake) }
+            let panelOn = queryDevicePanelOn()
+            DispatchQueue.main.async {
+                setScreenState(awake: awake)
+                devicePanelOn = panelOn
+            }
         }
     }
     RunLoop.main.add(t, forMode: .common)  // keep firing during event tracking
@@ -1173,7 +1201,7 @@ var settingsController: SettingsWindowController?
 
 // MARK: - App
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationDidFinishLaunching(_ n: Notification) {
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -1196,19 +1224,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private var screenOffItem: NSMenuItem!
-    private var screenOnItem: NSMenuItem!
-
     func setupMenu() {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
         if !isiOSMode {
-            screenOffItem = NSMenuItem(title: "黑屏", action: #selector(doScreenOff), keyEquivalent: "d")
-            screenOnItem = NSMenuItem(title: "亮屏", action: #selector(doScreenOn), keyEquivalent: "d")
-            screenOnItem.keyEquivalentModifierMask = [.command, .shift]
-            appMenu.addItem(screenOffItem)
-            appMenu.addItem(screenOnItem)
+            appMenu.addItem(withTitle: "黑屏", action: #selector(toggleScreen), keyEquivalent: "d")
+            appMenu.addItem(.separator())
+        }
+        if isMaster {
+            appMenu.addItem(makeBrightnessItem())
             appMenu.addItem(.separator())
         }
         appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
@@ -1219,12 +1244,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
-    @objc func doScreenOff() {
-        DispatchQueue.global().async { turnDeviceScreenOff() }
+    // Menu row = sun symbol + slider. Continuous: purely local, takes effect on
+    // the next frame. Persisted on mouse-up (Apply/restart would otherwise reset it).
+    private func makeBrightnessItem() -> NSMenuItem {
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
+        let icon = NSImageView(frame: NSRect(x: 14, y: 5, width: 18, height: 18))
+        icon.image = NSImage(systemSymbolName: "sun.max.fill", accessibilityDescription: "亮度")
+        icon.contentTintColor = .secondaryLabelColor
+        let slider = NSSlider(value: iconBrightness, minValue: iconBrightnessRange.lowerBound,
+                              maxValue: iconBrightnessRange.upperBound,
+                              target: self, action: #selector(brightnessChanged(_:)))
+        slider.frame = NSRect(x: 40, y: 4, width: 166, height: 20)
+        slider.isContinuous = true
+        view.addSubview(icon)
+        view.addSubview(slider)
+        let item = NSMenuItem()
+        item.view = view
+        return item
     }
 
-    @objc func doScreenOn() {
-        DispatchQueue.global().async { turnDeviceScreenOn() }
+    @objc func brightnessChanged(_ sender: NSSlider) {
+        iconBrightness = sender.doubleValue
+        if NSApp.currentEvent?.type == .leftMouseUp { saveConfig(allCrops) }
+    }
+
+    // Single toggle item: title follows the polled panel state.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(toggleScreen) {
+            switch devicePanelOn {
+            case true?: item.title = "黑屏"
+            case false?: item.title = "亮屏"
+            case nil: item.title = "切换黑屏"
+            }
+        }
+        return true
+    }
+
+    // Re-query the device at click time so a stale poll can't flip the wrong way.
+    @objc func toggleScreen() {
+        let cached = devicePanelOn
+        DispatchQueue.global().async {
+            let on = queryDevicePanelOn() ?? cached ?? true
+            setDevicePanel(on: !on)
+        }
     }
 
     @objc func openSettings() {
@@ -1261,7 +1323,7 @@ if isMaster {
             await killStaleScrcpy()
             await waitForAdbDevice()
             pushScreenPowerJars()
-            if turnScreenOffOnStart { deviceScreenIsOff = true }
+            if turnScreenOffOnStart { devicePanelOn = false }
             launchScrcpy()
             await startCapture()
             startScreenStatePolling()
